@@ -28,7 +28,7 @@ const (
 	helpBarHeight = 3
 	maxScrollVal  = 999999
 
-	helpText = "q quit  j/k nav  tab panel  s sessions  G follow  enter expand  a abort  r refresh"
+	helpText = "q quit  j/k nav  tab panel  f filter  s sessions  G follow  enter expand  a abort  r refresh"
 )
 
 type panel int
@@ -51,6 +51,7 @@ type Model struct {
 	agentNames      map[string]string
 	tree            []*treeNode
 	flatIDs         []string
+	showAll         bool
 	cursor          int
 	detailScroll    int
 	rootSessionID   string
@@ -250,6 +251,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.focus = (m.focus + 1) % panelCount
 	case "shift+tab":
 		m.focus = (m.focus + panelCount - 1) % panelCount
+	case "f":
+		m.showAll = !m.showAll
+		m = m.rebuildTree()
 	case "s":
 		m = m.openPicker()
 	case "G":
@@ -462,9 +466,23 @@ func (m Model) isDescendant(s client.Session) bool {
 
 func (m Model) rebuildTree() Model {
 	m.tree = buildTree(m.sessions, m.statuses, m.agentNames)
+	if !m.showAll {
+		m.tree = pruneIdle(m.tree)
+	}
 	m.flatIDs = flattenTree(m.tree)
 	m = m.clampedCursor()
 	return m
+}
+
+func pruneIdle(nodes []*treeNode) []*treeNode {
+	var result []*treeNode
+	for _, node := range nodes {
+		node.children = pruneIdle(node.children)
+		if node.status == statusBusy || len(node.children) > 0 {
+			result = append(result, node)
+		}
+	}
+	return result
 }
 
 func (m Model) selectedID() string {
