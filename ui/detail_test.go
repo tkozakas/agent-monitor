@@ -30,13 +30,13 @@ func TestFormatDurationHours(t *testing.T) {
 }
 
 func TestRenderDetailNilSession(t *testing.T) {
-	result := renderDetail(nil, "", nil, 80)
+	result := renderDetail(nil, "", nil, 80, 40, 0)
 	if result == "" {
 		t.Error("expected non-empty output for nil session")
 	}
 }
 
-func TestRenderDetailVerySmallWidth(t *testing.T) {
+func TestRenderDetailWithMessages(t *testing.T) {
 	sess := &client.Session{
 		ID:    "abcdef123456",
 		Title: "test session",
@@ -44,37 +44,50 @@ func TestRenderDetailVerySmallWidth(t *testing.T) {
 	sess.Time.Created = time.Now().Add(-1 * time.Minute).UnixMilli()
 	sess.Time.Updated = time.Now().UnixMilli()
 
-	todos := []client.Todo{
-		{ID: "t1", Content: "This is a long todo content that should not cause a panic", Status: "in_progress"},
+	msgs := []client.MessageWithParts{
+		{
+			Info: client.Message{Role: "assistant", Agent: "coder"},
+			Parts: []client.Part{
+				{Type: "text", Text: "Hello world"},
+				{Type: "tool", Tool: "bash", State: &client.ToolState{Status: "completed", Title: "Run tests"}},
+			},
+		},
 	}
 
-	// width=5 should not panic (maxLen = 5-10 = -5, guard prevents truncation)
-	result := renderDetail(sess, "busy", todos, 5)
-	if result == "" {
-		t.Error("expected non-empty output for width=5")
+	result := renderDetail(sess, "busy", msgs, 80, 40, 0)
+	if !strings.Contains(result, "coder") {
+		t.Error("expected agent name in output")
 	}
-	// The todo content should appear untruncated since maxLen <= 3
-	if !strings.Contains(result, "This is a long todo") {
-		t.Error("expected full todo content when width too small to truncate")
+	if !strings.Contains(result, "Hello world") {
+		t.Error("expected message text in output")
+	}
+	if !strings.Contains(result, "Run tests") {
+		t.Error("expected tool name in output")
 	}
 }
 
-func TestRenderDetailEdgeCaseWidth(t *testing.T) {
+func TestRenderDetailScrollOffset(t *testing.T) {
 	sess := &client.Session{
 		ID:    "abcdef123456",
-		Title: "test",
+		Title: "test session",
 	}
 	sess.Time.Created = time.Now().Add(-1 * time.Minute).UnixMilli()
 	sess.Time.Updated = time.Now().UnixMilli()
 
-	todos := []client.Todo{
-		{ID: "t1", Content: "Short", Status: "completed"},
+	msgs := []client.MessageWithParts{
+		{
+			Info: client.Message{Role: "assistant", Agent: "build"},
+			Parts: []client.Part{
+				{Type: "text", Text: "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10"},
+			},
+		},
 	}
 
-	// width=12 -> maxLen = 12-10 = 2, which is <= 3 so no truncation
-	result := renderDetail(sess, "idle", todos, 12)
-	if result == "" {
-		t.Error("expected non-empty output for width=12")
+	noScroll := renderDetail(sess, "busy", msgs, 80, 5, 0)
+	scrolled := renderDetail(sess, "busy", msgs, 80, 5, 2)
+
+	if noScroll == scrolled {
+		t.Error("expected scrolled output to differ from non-scrolled")
 	}
 }
 
@@ -91,8 +104,59 @@ func TestRenderDetailWithSummary(t *testing.T) {
 	sess.Time.Created = time.Now().Add(-1 * time.Minute).UnixMilli()
 	sess.Time.Updated = time.Now().UnixMilli()
 
-	result := renderDetail(sess, "busy", nil, 80)
-	if !strings.Contains(result, "Changes:") {
+	result := renderDetail(sess, "busy", nil, 80, 40, 0)
+	if !strings.Contains(result, "3 files") {
 		t.Error("expected summary section in output")
+	}
+}
+
+func TestRenderDetailSmallWidth(t *testing.T) {
+	sess := &client.Session{
+		ID:    "abcdef123456",
+		Title: "test session",
+	}
+	sess.Time.Created = time.Now().Add(-1 * time.Minute).UnixMilli()
+	sess.Time.Updated = time.Now().UnixMilli()
+
+	result := renderDetail(sess, "busy", nil, 5, 10, 0)
+	if result == "" {
+		t.Error("expected non-empty output for small width")
+	}
+}
+
+func TestClampWidth(t *testing.T) {
+	if clampWidth(0) != 1 {
+		t.Error("expected clampWidth(0) = 1")
+	}
+	if clampWidth(-5) != 1 {
+		t.Error("expected clampWidth(-5) = 1")
+	}
+	if clampWidth(50) != 50 {
+		t.Error("expected clampWidth(50) = 50")
+	}
+}
+
+func TestWrapText(t *testing.T) {
+	lines := wrapText("hello world", 5)
+	if len(lines) < 2 {
+		t.Errorf("expected at least 2 lines, got %d", len(lines))
+	}
+}
+
+func TestToolStatusIcon(t *testing.T) {
+	tests := []struct {
+		status string
+		want   string
+	}{
+		{"running", "⟳"},
+		{"completed", "✓"},
+		{"error", "✗"},
+		{"pending", "…"},
+	}
+	for _, tt := range tests {
+		got := toolStatusIcon(tt.status)
+		if got != tt.want {
+			t.Errorf("toolStatusIcon(%q) = %q, want %q", tt.status, got, tt.want)
+		}
 	}
 }

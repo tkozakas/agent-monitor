@@ -23,12 +23,11 @@ const (
 )
 
 // OpenCodeClient defines the interface for interacting with an opencode server.
-// It abstracts all API and SSE operations to enable mock testing.
 type OpenCodeClient interface {
 	Sessions() ([]Session, error)
 	SessionStatuses() (map[string]SessionStatus, error)
 	SessionChildren(id string) ([]Session, error)
-	SessionMessages(id string) ([]Message, error)
+	SessionMessages(id string) ([]MessageWithParts, error)
 	SessionTodos(id string) ([]Todo, error)
 	Agents() ([]AgentInfo, error)
 	Abort(sessionID string) error
@@ -74,6 +73,12 @@ type SessionStatus struct {
 	Type    string `json:"type"`
 	Attempt int    `json:"attempt,omitempty"`
 	Message string `json:"message,omitempty"`
+}
+
+// MessageWithParts wraps a message with its content parts as returned by the API.
+type MessageWithParts struct {
+	Info  Message `json:"info"`
+	Parts []Part  `json:"parts"`
 }
 
 // Message represents a single message within a session conversation.
@@ -178,9 +183,9 @@ func (c *Client) SessionChildren(id string) ([]Session, error) {
 	return get[[]Session](c, fmt.Sprintf(pathChildren, id))
 }
 
-// SessionMessages returns all messages in a session.
-func (c *Client) SessionMessages(id string) ([]Message, error) {
-	return get[[]Message](c, fmt.Sprintf(pathMessages, id))
+// SessionMessages returns all messages with their parts for a session.
+func (c *Client) SessionMessages(id string) ([]MessageWithParts, error) {
+	return get[[]MessageWithParts](c, fmt.Sprintf(pathMessages, id))
 }
 
 // SessionTodos returns all todo items for a session.

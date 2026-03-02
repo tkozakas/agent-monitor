@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -48,9 +49,12 @@ type Model struct {
 	sessions        []client.Session
 	statuses        map[string]client.SessionStatus
 	todos           map[string][]client.Todo
+	messages        map[string][]client.MessageWithParts
 	tree            []*treeNode
 	flatIDs         []string
 	cursor          int
+	detailScroll    int
+	rootSessionID   string
 	activities      []activity
 	err             error
 	refreshInterval time.Duration
@@ -66,6 +70,10 @@ type (
 		sessionID string
 		todos     []client.Todo
 	}
+	messagesMsg struct {
+		sessionID string
+		messages  []client.MessageWithParts
+	}
 	errMsg  struct{ err error }
 	tickMsg struct{}
 )
@@ -76,6 +84,7 @@ func New(oc client.OpenCodeClient) Model {
 		oc:              oc,
 		statuses:        make(map[string]client.SessionStatus),
 		todos:           make(map[string][]client.Todo),
+		messages:        make(map[string][]client.MessageWithParts),
 		refreshInterval: parseRefreshInterval(),
 	}
 }
@@ -98,12 +107,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case refreshMsg:
 		m.sessions = msg.sessions
 		m.statuses = msg.statuses
+		m = m.resolveRoot()
+		m = m.filterToTree()
 		m = m.rebuildTree()
-		return m, fetchTodos(m.oc, m.selectedID())
+		return m, tea.Batch(
+			fetchTodos(m.oc, m.selectedID()),
+			fetchMessages(m.oc, m.selectedID()),
+		)
 	case sseMsg:
 		return m.handleSSE(msg.event)
 	case todosMsg:
 		m.todos[msg.sessionID] = msg.todos
+	case messagesMsg:
+		m.messages[msg.sessionID] = msg.messages
 	case tickMsg:
 		return m, tea.Batch(fetchSessions(m.oc), tick(m.refreshInterval))
 	case errMsg:
@@ -146,8 +162,9 @@ func (m Model) View() tea.View {
 		}
 	}
 
+	msgs := m.messages[m.selectedID()]
 	detailPanel := panelBox("Details",
-		renderDetail(sess, status, m.todos[m.selectedID()], detailW-layoutPadding),
+		renderDetail(sess, status, msgs, detailW-layoutPadding, topH-panelBorderOffset-1, m.detailScroll),
 		detailW, topH, m.focus == panelDetail,
 	)
 
@@ -173,13 +190,32 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.oc.StopEvents()
 		return m, tea.Quit
 	case "j", "down":
+		if m.focus == panelDetail {
+			m.detailScroll++
+			return m, nil
+		}
 		m.cursor++
 		m = m.clampedCursor()
-		return m, fetchTodos(m.oc, m.selectedID())
+		m.detailScroll = 0
+		return m, tea.Batch(
+			fetchTodos(m.oc, m.selectedID()),
+			fetchMessages(m.oc, m.selectedID()),
+		)
 	case "k", "up":
+		if m.focus == panelDetail {
+			m.detailScroll--
+			if m.detailScroll < 0 {
+				m.detailScroll = 0
+			}
+			return m, nil
+		}
 		m.cursor--
 		m = m.clampedCursor()
-		return m, fetchTodos(m.oc, m.selectedID())
+		m.detailScroll = 0
+		return m, tea.Batch(
+			fetchTodos(m.oc, m.selectedID()),
+			fetchMessages(m.oc, m.selectedID()),
+		)
 	case "tab":
 		m.focus = (m.focus + 1) % panelCount
 	case "shift+tab":
@@ -199,51 +235,149 @@ func (m Model) handleSSE(event client.Event) (tea.Model, tea.Cmd) {
 	case client.EventSessionStatus:
 		var e client.SessionStatusEvent
 		if json.Unmarshal(event.Properties, &e) == nil {
-			m.statuses[e.SessionID] = e.Status
-			m = m.rebuildTree()
-			m.activities = append(m.activities, activity{
-				Time: time.Now(), SessionID: e.SessionID,
-				Kind: kindStatus, Summary: fmt.Sprintf("status → %s", e.Status.Type),
-			})
-			m = m.trimActivities()
+			if m.isInTree(e.SessionID) {
+				m.statuses[e.SessionID] = e.Status
+				m = m.rebuildTree()
+				m.activities = append(m.activities, activity{
+					Time: time.Now(), SessionID: e.SessionID,
+					Kind: kindStatus, Summary: fmt.Sprintf("status → %s", e.Status.Type),
+				})
+				m = m.trimActivities()
+			}
 		}
 	case client.EventSessionCreated:
 		var e client.SessionEvent
 		if json.Unmarshal(event.Properties, &e) == nil {
-			m.sessions = append(m.sessions, e.Info)
-			m = m.rebuildTree()
-			m.activities = append(m.activities, activity{
-				Time: time.Now(), SessionID: e.Info.ID,
-				Kind: kindStatus, Summary: fmt.Sprintf("session created: %s", e.Info.Title),
-			})
-			m = m.trimActivities()
+			if m.isDescendant(e.Info) {
+				m.sessions = append(m.sessions, e.Info)
+				m = m.rebuildTree()
+				m.activities = append(m.activities, activity{
+					Time: time.Now(), SessionID: e.Info.ID,
+					Kind: kindStatus, Summary: fmt.Sprintf("session created: %s", e.Info.Title),
+				})
+				m = m.trimActivities()
+			}
 		}
 	case client.EventSessionUpdated:
 		var e client.SessionEvent
 		if json.Unmarshal(event.Properties, &e) == nil {
-			for i := range m.sessions {
-				if m.sessions[i].ID == e.Info.ID {
-					m.sessions[i] = e.Info
-					break
+			if m.isInTree(e.Info.ID) {
+				for i := range m.sessions {
+					if m.sessions[i].ID == e.Info.ID {
+						m.sessions[i] = e.Info
+						break
+					}
 				}
+				m = m.rebuildTree()
 			}
-			m = m.rebuildTree()
 		}
 	case client.EventMessagePartUpdate:
 		var e client.MessagePartEvent
 		if json.Unmarshal(event.Properties, &e) == nil {
-			if a := partToActivity(e.Part); a != nil {
-				m.activities = append(m.activities, *a)
-				m = m.trimActivities()
+			if m.isInTree(e.Part.SessionID) {
+				if a := partToActivity(e.Part); a != nil {
+					m.activities = append(m.activities, *a)
+					m = m.trimActivities()
+				}
+				if e.Part.SessionID == m.selectedID() {
+					return m, tea.Batch(
+						listenSSE(m.oc),
+						fetchMessages(m.oc, e.Part.SessionID),
+					)
+				}
 			}
 		}
 	case client.EventTodoUpdated:
 		var e client.TodoEvent
 		if json.Unmarshal(event.Properties, &e) == nil {
-			m.todos[e.SessionID] = e.Todos
+			if m.isInTree(e.SessionID) {
+				m.todos[e.SessionID] = e.Todos
+			}
 		}
 	}
 	return m, listenSSE(m.oc)
+}
+
+func (m Model) resolveRoot() Model {
+	if len(m.sessions) == 0 {
+		return m
+	}
+
+	sorted := make([]client.Session, len(m.sessions))
+	copy(sorted, m.sessions)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Time.Created > sorted[j].Time.Created
+	})
+
+	// Find the most recent busy session.
+	for _, s := range sorted {
+		if s.ParentID != nil {
+			continue
+		}
+		if st, ok := m.statuses[s.ID]; ok && st.Type == statusBusy {
+			m.rootSessionID = s.ID
+			return m
+		}
+	}
+
+	// Fall back to the most recent root session.
+	for _, s := range sorted {
+		if s.ParentID == nil {
+			m.rootSessionID = s.ID
+			return m
+		}
+	}
+
+	m.rootSessionID = sorted[0].ID
+	return m
+}
+
+func (m Model) filterToTree() Model {
+	if m.rootSessionID == "" {
+		return m
+	}
+
+	idSet := m.treeIDs()
+	var filtered []client.Session
+	for _, s := range m.sessions {
+		if idSet[s.ID] {
+			filtered = append(filtered, s)
+		}
+	}
+	m.sessions = filtered
+	return m
+}
+
+func (m Model) treeIDs() map[string]bool {
+	ids := map[string]bool{m.rootSessionID: true}
+	changed := true
+	for changed {
+		changed = false
+		for _, s := range m.sessions {
+			if s.ParentID != nil && ids[*s.ParentID] && !ids[s.ID] {
+				ids[s.ID] = true
+				changed = true
+			}
+		}
+	}
+	return ids
+}
+
+func (m Model) isInTree(sessionID string) bool {
+	if m.rootSessionID == "" {
+		return true
+	}
+	return m.treeIDs()[sessionID]
+}
+
+func (m Model) isDescendant(s client.Session) bool {
+	if m.rootSessionID == "" {
+		return true
+	}
+	if s.ParentID == nil {
+		return s.ID == m.rootSessionID
+	}
+	return m.treeIDs()[*s.ParentID]
 }
 
 func (m Model) rebuildTree() Model {
@@ -341,6 +475,19 @@ func fetchTodos(oc client.OpenCodeClient, sessionID string) tea.Cmd {
 			return nil
 		}
 		return todosMsg{sessionID: sessionID, todos: todos}
+	}
+}
+
+func fetchMessages(oc client.OpenCodeClient, sessionID string) tea.Cmd {
+	if sessionID == "" {
+		return nil
+	}
+	return func() tea.Msg {
+		msgs, err := oc.SessionMessages(sessionID)
+		if err != nil {
+			return nil
+		}
+		return messagesMsg{sessionID: sessionID, messages: msgs}
 	}
 }
 
