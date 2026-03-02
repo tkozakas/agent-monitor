@@ -145,41 +145,44 @@ func (m Model) View() tea.View {
 		return v
 	}
 
-	treeW := m.width * treeWidthPercent / 100
-	detailW := m.width - treeW - layoutPadding
 	contentH := m.height - helpBarHeight
 
-	var treeContent string
+	var topRow string
 	if m.graphView {
-		treeContent = renderGraphTree(m.tree, m.selectedID(), treeW-layoutPadding)
+		fullW := m.width - panelBorderOffset
+		treeContent := renderGraphTree(m.tree, m.selectedID(), fullW-layoutPadding)
+		topRow = panelBox("Agents", treeContent, fullW, contentH, true)
 	} else {
-		treeContent = renderTree(m.tree, m.selectedID(), treeW-layoutPadding)
-	}
-	treePanel := panelBox("Agents", treeContent, treeW, contentH, m.focus == panelTree)
+		treeW := m.width * treeWidthPercent / 100
+		detailW := m.width - treeW - layoutPadding
 
-	var (
-		sess   *client.Session
-		status string
-	)
-	if id := m.selectedID(); id != "" {
-		for i := range m.sessions {
-			if m.sessions[i].ID == id {
-				sess = &m.sessions[i]
-				if st, ok := m.statuses[id]; ok {
-					status = st.Type
+		treeContent := renderTree(m.tree, m.selectedID(), treeW-layoutPadding)
+		treePanel := panelBox("Agents", treeContent, treeW, contentH, m.focus == panelTree)
+
+		var (
+			sess   *client.Session
+			status string
+		)
+		if id := m.selectedID(); id != "" {
+			for i := range m.sessions {
+				if m.sessions[i].ID == id {
+					sess = &m.sessions[i]
+					if st, ok := m.statuses[id]; ok {
+						status = st.Type
+					}
+					break
 				}
-				break
 			}
 		}
+
+		msgs := m.messages[m.selectedID()]
+		detailPanel := panelBox("Details",
+			renderDetail(sess, status, msgs, detailW-layoutPadding, contentH-panelBorderOffset-1, m.detailScroll, m.expandTools),
+			detailW, contentH, m.focus == panelDetail,
+		)
+
+		topRow = lipgloss.JoinHorizontal(lipgloss.Top, treePanel, detailPanel)
 	}
-
-	msgs := m.messages[m.selectedID()]
-	detailPanel := panelBox("Details",
-		renderDetail(sess, status, msgs, detailW-layoutPadding, contentH-panelBorderOffset-1, m.detailScroll, m.expandTools),
-		detailW, contentH, m.focus == panelDetail,
-	)
-
-	topRow := lipgloss.JoinHorizontal(lipgloss.Top, treePanel, detailPanel)
 
 	help := styleHelp.Render(helpText)
 	if m.err != nil {
