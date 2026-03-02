@@ -48,6 +48,7 @@ type Model struct {
 	statuses        map[string]client.SessionStatus
 	todos           map[string][]client.Todo
 	messages        map[string][]client.MessageWithParts
+	agentNames      map[string]string
 	tree            []*treeNode
 	flatIDs         []string
 	cursor          int
@@ -87,6 +88,7 @@ func New(oc client.OpenCodeClient) Model {
 		statuses:        make(map[string]client.SessionStatus),
 		todos:           make(map[string][]client.Todo),
 		messages:        make(map[string][]client.MessageWithParts),
+		agentNames:      make(map[string]string),
 		followMode:      true,
 		refreshInterval: parseRefreshInterval(),
 	}
@@ -113,16 +115,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m = m.resolveRoot()
 		m = m.filterToTree()
 		m = m.rebuildTree()
-		return m, tea.Batch(
-			fetchTodos(m.oc, m.selectedID()),
-			fetchMessages(m.oc, m.selectedID()),
-		)
+		return m, m.fetchTreeData()
 	case sseMsg:
 		return m.handleSSE(msg.event)
 	case todosMsg:
 		m.todos[msg.sessionID] = msg.todos
 	case messagesMsg:
 		m.messages[msg.sessionID] = msg.messages
+		if name := extractAgentName(msg.messages); name != "" {
+			if m.agentNames[msg.sessionID] != name {
+				m.agentNames[msg.sessionID] = name
+				m = m.rebuildTree()
+			}
+		}
 	case tickMsg:
 		return m, tea.Batch(fetchSessions(m.oc), tick(m.refreshInterval))
 	case errMsg:
@@ -282,6 +287,10 @@ func (m Model) handleSSE(event client.Event) (tea.Model, tea.Cmd) {
 			if m.isDescendant(e.Info) {
 				m.sessions = append(m.sessions, e.Info)
 				m = m.rebuildTree()
+				return m, tea.Batch(
+					listenSSE(m.oc),
+					fetchMessages(m.oc, e.Info.ID),
+				)
 			}
 		}
 	case client.EventSessionUpdated:
@@ -454,7 +463,7 @@ func (m Model) isDescendant(s client.Session) bool {
 }
 
 func (m Model) rebuildTree() Model {
-	m.tree = buildTree(m.sessions, m.statuses)
+	m.tree = buildTree(m.sessions, m.statuses, m.agentNames)
 	m.flatIDs = flattenTree(m.tree)
 	m = m.clampedCursor()
 	return m
@@ -571,6 +580,24 @@ func tick(interval time.Duration) tea.Cmd {
 		time.Sleep(interval)
 		return tickMsg{}
 	}
+}
+
+func (m Model) fetchTreeData() tea.Cmd {
+	cmds := make([]tea.Cmd, 0, len(m.flatIDs)+1)
+	for _, id := range m.flatIDs {
+		cmds = append(cmds, fetchMessages(m.oc, id))
+	}
+	cmds = append(cmds, fetchTodos(m.oc, m.selectedID()))
+	return tea.Batch(cmds...)
+}
+
+func extractAgentName(messages []client.MessageWithParts) string {
+	for _, msg := range messages {
+		if msg.Info.Agent != "" {
+			return msg.Info.Agent
+		}
+	}
+	return ""
 }
 
 func parseRefreshInterval() time.Duration {

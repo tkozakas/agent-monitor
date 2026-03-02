@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/tkozakas/agent-monitor/client"
@@ -16,7 +17,7 @@ func TestBuildTreeRoots(t *testing.T) {
 		"s2": {Type: "idle"},
 	}
 
-	tree := buildTree(sessions, statuses)
+	tree := buildTree(sessions, statuses, nil)
 	if len(tree) != 2 {
 		t.Fatalf("expected 2 roots, got %d", len(tree))
 	}
@@ -33,7 +34,7 @@ func TestBuildTreeParentChild(t *testing.T) {
 		"c1": {Type: "idle"},
 	}
 
-	tree := buildTree(sessions, statuses)
+	tree := buildTree(sessions, statuses, nil)
 	if len(tree) != 1 {
 		t.Fatalf("expected 1 root, got %d", len(tree))
 	}
@@ -51,7 +52,7 @@ func TestBuildTreeOrphanChild(t *testing.T) {
 		{ID: "c1", Title: "orphan", ParentID: &missingParent},
 	}
 
-	tree := buildTree(sessions, nil)
+	tree := buildTree(sessions, nil, nil)
 	if len(tree) != 1 {
 		t.Fatalf("expected orphan promoted to root, got %d roots", len(tree))
 	}
@@ -65,7 +66,7 @@ func TestFlattenTree(t *testing.T) {
 		{ID: "c2", Title: "child2", ParentID: &parentID},
 	}
 
-	tree := buildTree(sessions, nil)
+	tree := buildTree(sessions, nil, nil)
 	ids := flattenTree(tree)
 	if len(ids) != 3 {
 		t.Fatalf("expected 3 ids, got %d", len(ids))
@@ -77,8 +78,93 @@ func TestFlattenTree(t *testing.T) {
 
 func TestBuildTreeStatusDefault(t *testing.T) {
 	sessions := []client.Session{{ID: "s1", Title: "test"}}
-	tree := buildTree(sessions, nil)
+	tree := buildTree(sessions, nil, nil)
 	if tree[0].status != "idle" {
 		t.Errorf("expected default status idle, got %s", tree[0].status)
+	}
+}
+
+func TestBuildTreeAgentNames(t *testing.T) {
+	parentID := "p1"
+	sessions := []client.Session{
+		{ID: "p1", Title: "session-title"},
+		{ID: "c1", Title: "child-title", ParentID: &parentID},
+	}
+	agents := map[string]string{
+		"p1": "build",
+		"c1": "coder",
+	}
+
+	tree := buildTree(sessions, nil, agents)
+	if tree[0].agent != "build" {
+		t.Errorf("expected root agent build, got %s", tree[0].agent)
+	}
+	if tree[0].children[0].agent != "coder" {
+		t.Errorf("expected child agent coder, got %s", tree[0].children[0].agent)
+	}
+}
+
+func TestBuildTreeAgentNameFallback(t *testing.T) {
+	sessions := []client.Session{{ID: "s1", Title: "my-session"}}
+	tree := buildTree(sessions, nil, nil)
+	if tree[0].agent != "" {
+		t.Errorf("expected empty agent without agentNames, got %s", tree[0].agent)
+	}
+}
+
+func TestRenderTreeShowsAgentName(t *testing.T) {
+	parentID := "p1"
+	sessions := []client.Session{
+		{ID: "p1", Title: "session-title"},
+		{ID: "c1", Title: "child-title", ParentID: &parentID},
+		{ID: "c2", Title: "child-title-2", ParentID: &parentID},
+	}
+	agents := map[string]string{
+		"p1": "build",
+		"c1": "coder",
+		"c2": "researcher",
+	}
+	statuses := map[string]client.SessionStatus{
+		"p1": {Type: "busy"},
+		"c1": {Type: "busy"},
+		"c2": {Type: "busy"},
+	}
+
+	tree := buildTree(sessions, statuses, agents)
+	output := renderTree(tree, "p1", 60)
+
+	if !strings.Contains(output, "build") {
+		t.Error("expected tree to contain agent name 'build'")
+	}
+	if !strings.Contains(output, "coder") {
+		t.Error("expected tree to contain agent name 'coder'")
+	}
+	if !strings.Contains(output, "researcher") {
+		t.Error("expected tree to contain agent name 'researcher'")
+	}
+}
+
+func TestExtractAgentName(t *testing.T) {
+	msgs := []client.MessageWithParts{
+		{Info: client.Message{Role: "user"}},
+		{Info: client.Message{Role: "assistant", Agent: "coder"}},
+	}
+	if got := extractAgentName(msgs); got != "coder" {
+		t.Errorf("expected coder, got %s", got)
+	}
+}
+
+func TestExtractAgentNameEmpty(t *testing.T) {
+	msgs := []client.MessageWithParts{
+		{Info: client.Message{Role: "user"}},
+	}
+	if got := extractAgentName(msgs); got != "" {
+		t.Errorf("expected empty, got %s", got)
+	}
+}
+
+func TestExtractAgentNameNil(t *testing.T) {
+	if got := extractAgentName(nil); got != "" {
+		t.Errorf("expected empty for nil, got %s", got)
 	}
 }

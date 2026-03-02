@@ -24,10 +24,11 @@ const (
 type treeNode struct {
 	session  client.Session
 	status   string
+	agent    string
 	children []*treeNode
 }
 
-func buildTree(sessions []client.Session, statuses map[string]client.SessionStatus) []*treeNode {
+func buildTree(sessions []client.Session, statuses map[string]client.SessionStatus, agentNames map[string]string) []*treeNode {
 	byID := make(map[string]*treeNode, len(sessions))
 	var roots []*treeNode
 
@@ -36,7 +37,11 @@ func buildTree(sessions []client.Session, statuses map[string]client.SessionStat
 		if st, ok := statuses[s.ID]; ok {
 			status = st.Type
 		}
-		byID[s.ID] = &treeNode{session: s, status: status}
+		var agent string
+		if agentNames != nil {
+			agent = agentNames[s.ID]
+		}
+		byID[s.ID] = &treeNode{session: s, status: status, agent: agent}
 	}
 
 	for _, node := range byID {
@@ -74,20 +79,23 @@ func renderNode(b *strings.Builder, node *treeNode, selected, prefix string, las
 	icon := statusIcon(node.status)
 	clr := statusColor(node.status)
 
-	title := node.session.Title
-	if title == "" && len(node.session.ID) >= titleIDLen {
-		title = node.session.ID[:titleIDLen]
+	name := node.agent
+	if name == "" {
+		name = node.session.Title
 	}
-	if len(title) > maxTitleLen {
-		title = title[:maxTitleLen-3] + "..."
+	if name == "" && len(node.session.ID) >= titleIDLen {
+		name = node.session.ID[:titleIDLen]
+	}
+	if len(name) > maxTitleLen {
+		name = name[:maxTitleLen-3] + "..."
 	}
 
-	line := fmt.Sprintf("%s%s %s %s",
+	line := fmt.Sprintf("%s%s %s %s %s",
 		prefix, connector,
 		lipgloss.NewStyle().Foreground(clr).Render(icon),
-		title,
+		lipgloss.NewStyle().Bold(true).Render(name),
+		styleDim.Render(node.status),
 	)
-	line += " " + lipgloss.NewStyle().Foreground(clr).Render(fmt.Sprintf("[%s]", node.status))
 
 	if node.session.ID == selected {
 		line = styleSelected.Render(cursorIndicator) + line
