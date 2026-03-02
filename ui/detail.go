@@ -16,6 +16,14 @@ const (
 	partTextMaxLines    = 20
 	sparklineWidth      = 20
 	toolExpandMaxLines  = 10
+
+	partTypeTool    = "tool"
+	partTypeSubtask = "subtask"
+	partTypeText    = "text"
+
+	toolStatusRunning   = "running"
+	toolStatusCompleted = "completed"
+	toolStatusError     = "error"
 )
 
 var (
