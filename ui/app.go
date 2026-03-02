@@ -20,16 +20,15 @@ const (
 
 	defaultRefreshInterval = 5 * time.Second
 
-	treeWidthPercent  = 35
-	topHeightPercent  = 55
+	treeWidthPercent  = 30
 	layoutPadding     = 4
-	layoutBottomExtra = 5
 	panelBorderOffset = 2
-	panelCount        = 3
+	panelCount        = 2
 
-	maxActivities = 200
+	helpBarHeight = 3
+	maxScrollVal  = 999999
 
-	helpText = "q quit  j/k nav  tab panel  a abort  r refresh"
+	helpText = "q quit  j/k nav  tab panel  s sessions  G follow  enter expand  a abort  r refresh"
 )
 
 type panel int
@@ -37,7 +36,6 @@ type panel int
 const (
 	panelTree panel = iota
 	panelDetail
-	panelActivity
 )
 
 // Model is the top-level Bubble Tea model for the agent monitor TUI.
@@ -55,7 +53,11 @@ type Model struct {
 	cursor          int
 	detailScroll    int
 	rootSessionID   string
-	activities      []activity
+	followMode      bool
+	expandTools     bool
+	showPicker      bool
+	pickerSessions  []client.Session
+	pickerCursor    int
 	err             error
 	refreshInterval time.Duration
 }
@@ -85,6 +87,7 @@ func New(oc client.OpenCodeClient) Model {
 		statuses:        make(map[string]client.SessionStatus),
 		todos:           make(map[string][]client.Todo),
 		messages:        make(map[string][]client.MessageWithParts),
+		followMode:      true,
 		refreshInterval: parseRefreshInterval(),
 	}
 }
@@ -138,12 +141,11 @@ func (m Model) View() tea.View {
 
 	treeW := m.width * treeWidthPercent / 100
 	detailW := m.width - treeW - layoutPadding
-	topH := m.height*topHeightPercent/100 - panelBorderOffset
-	bottomH := m.height - topH - layoutBottomExtra
+	contentH := m.height - helpBarHeight
 
 	treePanel := panelBox("Agents",
 		renderTree(m.tree, m.selectedID(), treeW-layoutPadding),
-		treeW, topH, m.focus == panelTree,
+		treeW, contentH, m.focus == panelTree,
 	)
 
 	var (
@@ -164,15 +166,11 @@ func (m Model) View() tea.View {
 
 	msgs := m.messages[m.selectedID()]
 	detailPanel := panelBox("Details",
-		renderDetail(sess, status, msgs, detailW-layoutPadding, topH-panelBorderOffset-1, m.detailScroll),
-		detailW, topH, m.focus == panelDetail,
+		renderDetail(sess, status, msgs, detailW-layoutPadding, contentH-panelBorderOffset-1, m.detailScroll, m.expandTools),
+		detailW, contentH, m.focus == panelDetail,
 	)
 
 	topRow := lipgloss.JoinHorizontal(lipgloss.Top, treePanel, detailPanel)
-	actPanel := panelBox("Activity",
-		renderActivity(m.activities, m.width-layoutPadding),
-		m.width-panelBorderOffset, bottomH, m.focus == panelActivity,
-	)
 
 	help := styleHelp.Render(helpText)
 	if m.err != nil {
@@ -180,17 +178,45 @@ func (m Model) View() tea.View {
 			Render(fmt.Sprintf("Error: %v", m.err))
 	}
 
-	v.Content = lipgloss.JoinVertical(lipgloss.Left, topRow, actPanel, help)
+	v.Content = lipgloss.JoinVertical(lipgloss.Left, topRow, help)
+
+	if m.showPicker {
+		overlay := renderPicker(m.pickerSessions, m.statuses, m.pickerCursor, m.width, m.height)
+		v.Content = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, overlay)
+	}
+
 	return v
 }
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.showPicker {
+		switch msg.String() {
+		case "j", "down":
+			m.pickerCursor++
+			if m.pickerCursor >= len(m.pickerSessions) {
+				m.pickerCursor = len(m.pickerSessions) - 1
+			}
+		case "k", "up":
+			m.pickerCursor--
+			if m.pickerCursor < 0 {
+				m.pickerCursor = 0
+			}
+		case "enter":
+			m = m.selectPickerSession()
+			return m, tea.Batch(fetchSessions(m.oc), fetchMessages(m.oc, m.selectedID()))
+		case "esc", "q", "s":
+			m.showPicker = false
+		}
+		return m, nil
+	}
+
 	switch msg.String() {
 	case "q", "esc":
 		m.oc.StopEvents()
 		return m, tea.Quit
 	case "j", "down":
 		if m.focus == panelDetail {
+			m.followMode = false
 			m.detailScroll++
 			return m, nil
 		}
@@ -203,6 +229,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		)
 	case "k", "up":
 		if m.focus == panelDetail {
+			m.followMode = false
 			m.detailScroll--
 			if m.detailScroll < 0 {
 				m.detailScroll = 0
@@ -220,6 +247,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.focus = (m.focus + 1) % panelCount
 	case "shift+tab":
 		m.focus = (m.focus + panelCount - 1) % panelCount
+	case "s":
+		m = m.openPicker()
+	case "G":
+		m.followMode = true
+		m.detailScroll = maxScrollVal
+	case "enter":
+		if m.focus == panelDetail {
+			m.expandTools = !m.expandTools
+		}
 	case "a":
 		if id := m.selectedID(); id != "" {
 			return m, abortSession(m.oc, id)
@@ -238,11 +274,6 @@ func (m Model) handleSSE(event client.Event) (tea.Model, tea.Cmd) {
 			if m.isInTree(e.SessionID) {
 				m.statuses[e.SessionID] = e.Status
 				m = m.rebuildTree()
-				m.activities = append(m.activities, activity{
-					Time: time.Now(), SessionID: e.SessionID,
-					Kind: kindStatus, Summary: fmt.Sprintf("status → %s", e.Status.Type),
-				})
-				m = m.trimActivities()
 			}
 		}
 	case client.EventSessionCreated:
@@ -251,11 +282,6 @@ func (m Model) handleSSE(event client.Event) (tea.Model, tea.Cmd) {
 			if m.isDescendant(e.Info) {
 				m.sessions = append(m.sessions, e.Info)
 				m = m.rebuildTree()
-				m.activities = append(m.activities, activity{
-					Time: time.Now(), SessionID: e.Info.ID,
-					Kind: kindStatus, Summary: fmt.Sprintf("session created: %s", e.Info.Title),
-				})
-				m = m.trimActivities()
 			}
 		}
 	case client.EventSessionUpdated:
@@ -275,11 +301,10 @@ func (m Model) handleSSE(event client.Event) (tea.Model, tea.Cmd) {
 		var e client.MessagePartEvent
 		if json.Unmarshal(event.Properties, &e) == nil {
 			if m.isInTree(e.Part.SessionID) {
-				if a := partToActivity(e.Part); a != nil {
-					m.activities = append(m.activities, *a)
-					m = m.trimActivities()
-				}
 				if e.Part.SessionID == m.selectedID() {
+					if m.followMode {
+						m.detailScroll = maxScrollVal
+					}
 					return m, tea.Batch(
 						listenSSE(m.oc),
 						fetchMessages(m.oc, e.Part.SessionID),
@@ -298,9 +323,59 @@ func (m Model) handleSSE(event client.Event) (tea.Model, tea.Cmd) {
 	return m, listenSSE(m.oc)
 }
 
+func (m Model) openPicker() Model {
+	m.showPicker = true
+	m.pickerCursor = 0
+
+	var roots []client.Session
+	for _, s := range m.sessions {
+		if s.ParentID == nil {
+			roots = append(roots, s)
+		}
+	}
+	sort.Slice(roots, func(i, j int) bool {
+		return roots[i].Time.Created > roots[j].Time.Created
+	})
+	m.pickerSessions = roots
+
+	for i, s := range m.pickerSessions {
+		if s.ID == m.rootSessionID {
+			m.pickerCursor = i
+			break
+		}
+	}
+
+	return m
+}
+
+func (m Model) selectPickerSession() Model {
+	if len(m.pickerSessions) == 0 {
+		m.showPicker = false
+		return m
+	}
+	if m.pickerCursor >= len(m.pickerSessions) {
+		m.pickerCursor = len(m.pickerSessions) - 1
+	}
+	m.rootSessionID = m.pickerSessions[m.pickerCursor].ID
+	m.showPicker = false
+	m.cursor = 0
+	m.detailScroll = 0
+	m = m.filterToTree()
+	m = m.rebuildTree()
+	return m
+}
+
 func (m Model) resolveRoot() Model {
 	if len(m.sessions) == 0 {
 		return m
+	}
+
+	if m.rootSessionID != "" {
+		for _, s := range m.sessions {
+			if s.ID == m.rootSessionID {
+				return m
+			}
+		}
 	}
 
 	sorted := make([]client.Session, len(m.sessions))
@@ -309,7 +384,6 @@ func (m Model) resolveRoot() Model {
 		return sorted[i].Time.Created > sorted[j].Time.Created
 	})
 
-	// Find the most recent busy session.
 	for _, s := range sorted {
 		if s.ParentID != nil {
 			continue
@@ -320,7 +394,6 @@ func (m Model) resolveRoot() Model {
 		}
 	}
 
-	// Fall back to the most recent root session.
 	for _, s := range sorted {
 		if s.ParentID == nil {
 			m.rootSessionID = s.ID
@@ -404,13 +477,6 @@ func (m Model) clampedCursor() Model {
 	}
 	if m.cursor > max {
 		m.cursor = max
-	}
-	return m
-}
-
-func (m Model) trimActivities() Model {
-	if len(m.activities) > maxActivities {
-		m.activities = m.activities[len(m.activities)-maxActivities:]
 	}
 	return m
 }

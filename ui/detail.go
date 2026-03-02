@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -13,6 +14,8 @@ const (
 	sessionIDPreviewLen = 12
 	metaHeaderLines     = 3
 	partTextMaxLines    = 20
+	sparklineWidth      = 20
+	toolExpandMaxLines  = 10
 )
 
 var (
@@ -20,6 +23,11 @@ var (
 	styleToolLine  = lipgloss.NewStyle().Foreground(colorMagenta)
 	styleSubtask   = lipgloss.NewStyle().Foreground(colorCyan)
 	styleRole      = lipgloss.NewStyle().Foreground(colorBlue).Bold(true)
+	styleCostLine  = lipgloss.NewStyle().Foreground(colorDim)
+
+	styleSparkIn    = lipgloss.NewStyle().Foreground(colorBlue)
+	styleSparkOut   = lipgloss.NewStyle().Foreground(colorGreen)
+	styleSparkCache = lipgloss.NewStyle().Foreground(colorDim)
 )
 
 func renderDetail(
@@ -27,6 +35,7 @@ func renderDetail(
 	status string,
 	messages []client.MessageWithParts,
 	width, visibleLines, scroll int,
+	expandTools bool,
 ) string {
 	if session == nil {
 		return styleDim.Render("  No session selected")
@@ -53,6 +62,20 @@ func renderDetail(
 		duration,
 	))
 
+	totalCost, totalIn, totalOut, totalReasoning, totalCache := aggregateCost(messages)
+	if totalCost > 0 || totalIn > 0 || totalOut > 0 {
+		costStr := fmt.Sprintf("  $%.2f  %s in  %s out",
+			totalCost, formatTokens(totalIn), formatTokens(totalOut))
+		if totalReasoning > 0 {
+			costStr += fmt.Sprintf("  %s reason", formatTokens(totalReasoning))
+		}
+		if totalCache > 0 {
+			costStr += fmt.Sprintf("  %s cache", formatTokens(totalCache))
+		}
+		b.WriteString(styleCostLine.Render(costStr) + "\n")
+		b.WriteString("  " + renderSparkline(totalIn, totalOut, totalCache, sparklineWidth) + "\n")
+	}
+
 	if session.Summary != nil {
 		s := session.Summary
 		b.WriteString(fmt.Sprintf("  %s+%d %s-%d%s  %d files\n",
@@ -64,7 +87,7 @@ func renderDetail(
 
 	b.WriteString(styleDim.Render("  "+strings.Repeat("─", clampWidth(width-4))) + "\n")
 
-	renderMessageStream(&b, messages, width)
+	renderMessageStream(&b, messages, width, expandTools)
 
 	allLines := strings.Split(b.String(), "\n")
 	if scroll > len(allLines)-visibleLines {
@@ -82,7 +105,55 @@ func renderDetail(
 	return strings.Join(allLines[scroll:end], "\n")
 }
 
-func renderMessageStream(b *strings.Builder, messages []client.MessageWithParts, width int) {
+func aggregateCost(messages []client.MessageWithParts) (totalCost float64, totalIn, totalOut, totalReasoning, totalCacheRead int) {
+	for _, msg := range messages {
+		totalCost += msg.Info.Cost
+		if msg.Info.Tokens != nil {
+			totalIn += msg.Info.Tokens.Input
+			totalOut += msg.Info.Tokens.Output
+			totalReasoning += msg.Info.Tokens.Reasoning
+			totalCacheRead += msg.Info.Tokens.Cache.Read
+		}
+	}
+	return
+}
+
+func formatTokens(n int) string {
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	return fmt.Sprintf("%.1fk", float64(n)/1000)
+}
+
+func renderSparkline(in, out, cache, width int) string {
+	total := in + out + cache
+	if total == 0 || width <= 0 {
+		return ""
+	}
+
+	inW := in * width / total
+	outW := out * width / total
+	cacheW := width - inW - outW
+	if cacheW < 0 {
+		cacheW = 0
+	}
+
+	var b strings.Builder
+	b.WriteString("[")
+	b.WriteString(styleSparkIn.Render(strings.Repeat("█", inW)))
+	b.WriteString(styleSparkOut.Render(strings.Repeat("█", outW)))
+	b.WriteString(styleSparkCache.Render(strings.Repeat("░", cacheW)))
+	b.WriteString("]")
+
+	inPct := in * 100 / total
+	outPct := out * 100 / total
+	cachePct := cache * 100 / total
+	b.WriteString(fmt.Sprintf(" in:%d%% out:%d%% cache:%d%%", inPct, outPct, cachePct))
+
+	return b.String()
+}
+
+func renderMessageStream(b *strings.Builder, messages []client.MessageWithParts, width int, expandTools bool) {
 	if len(messages) == 0 {
 		b.WriteString(styleDim.Render("  Waiting for messages..."))
 		return
@@ -98,13 +169,13 @@ func renderMessageStream(b *strings.Builder, messages []client.MessageWithParts,
 		b.WriteString(fmt.Sprintf("  %s\n", styleRole.Render(label)))
 
 		for _, p := range msg.Parts {
-			renderPart(b, p, width)
+			renderPart(b, p, width, expandTools)
 		}
 		b.WriteString("\n")
 	}
 }
 
-func renderPart(b *strings.Builder, p client.Part, width int) {
+func renderPart(b *strings.Builder, p client.Part, width int, expandTools bool) {
 	contentWidth := clampWidth(width - 4)
 
 	switch p.Type {
@@ -132,6 +203,10 @@ func renderPart(b *strings.Builder, p client.Part, width int) {
 		icon := toolStatusIcon(st)
 		b.WriteString(fmt.Sprintf("  %s %s\n", styleToolLine.Render(icon+" "+name), styleDim.Render(st)))
 
+		if expandTools && p.State != nil {
+			renderToolExpanded(b, p.State, contentWidth)
+		}
+
 	case partTypeSubtask:
 		desc := p.Description
 		if desc == "" {
@@ -149,6 +224,50 @@ func renderPart(b *strings.Builder, p client.Part, width int) {
 	case "step-start":
 		// ignore
 	}
+}
+
+func renderToolExpanded(b *strings.Builder, state *client.ToolState, width int) {
+	if len(state.Input) > 0 {
+		formatted := formatJSON(state.Input, width)
+		lines := strings.Split(formatted, "\n")
+		if len(lines) > toolExpandMaxLines {
+			lines = lines[:toolExpandMaxLines]
+			lines = append(lines, "    ...")
+		}
+		for _, line := range lines {
+			b.WriteString("    " + styleDim.Render(line) + "\n")
+		}
+	}
+	if state.Output != "" {
+		lines := strings.Split(state.Output, "\n")
+		if len(lines) > toolExpandMaxLines {
+			lines = lines[:toolExpandMaxLines]
+			lines = append(lines, "    ...")
+		}
+		for _, line := range lines {
+			truncated := line
+			if len(truncated) > width {
+				truncated = truncated[:width-3] + "..."
+			}
+			b.WriteString("    " + truncated + "\n")
+		}
+	}
+}
+
+func formatJSON(raw json.RawMessage, width int) string {
+	var parsed interface{}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		s := string(raw)
+		if len(s) > width {
+			s = s[:width-3] + "..."
+		}
+		return s
+	}
+	formatted, err := json.MarshalIndent(parsed, "", "  ")
+	if err != nil {
+		return string(raw)
+	}
+	return string(formatted)
 }
 
 func toolStatusIcon(status string) string {
