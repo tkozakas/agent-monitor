@@ -25,16 +25,6 @@ Start OpenCode in one terminal, then run:
 agent-monitor
 ```
 
-It auto-discovers the server port from OpenCode's state directory. Override with env vars if needed:
-
-| Variable | Description |
-|---|---|
-| `OPENCODE_URL` | Full server URL (e.g. `http://localhost:3000`) |
-| `OPENCODE_PORT` | Server port |
-| `OPENCODE_HOST` | Server host (default: `localhost`) |
-| `OPENCODE_DIR` | Project dir for state discovery (default: cwd) |
-| `AGENT_MONITOR_REFRESH` | Refresh interval (default: `5s`) |
-
 ### Keybinds
 
 | Key | Action |
