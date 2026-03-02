@@ -28,7 +28,7 @@ const (
 	helpBarHeight = 3
 	maxScrollVal  = 999999
 
-	helpText = "q quit  j/k nav  tab panel  s sessions  G follow  enter expand  a abort  r refresh"
+	helpText = "q quit  j/k nav  tab panel  t tree  s sessions  G follow  enter expand  a abort  r refresh"
 )
 
 type panel int
@@ -50,6 +50,7 @@ type Model struct {
 	messages        map[string][]client.MessageWithParts
 	agentNames      map[string]string
 	tree            []*treeNode
+	graphView       bool
 	flatIDs         []string
 	cursor          int
 	detailScroll    int
@@ -148,10 +149,13 @@ func (m Model) View() tea.View {
 	detailW := m.width - treeW - layoutPadding
 	contentH := m.height - helpBarHeight
 
-	treePanel := panelBox("Agents",
-		renderTree(m.tree, m.selectedID(), treeW-layoutPadding),
-		treeW, contentH, m.focus == panelTree,
-	)
+	var treeContent string
+	if m.graphView {
+		treeContent = renderGraphTree(m.tree, m.selectedID(), treeW-layoutPadding)
+	} else {
+		treeContent = renderTree(m.tree, m.selectedID(), treeW-layoutPadding)
+	}
+	treePanel := panelBox("Agents", treeContent, treeW, contentH, m.focus == panelTree)
 
 	var (
 		sess   *client.Session
@@ -252,6 +256,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.focus = (m.focus + 1) % panelCount
 	case "shift+tab":
 		m.focus = (m.focus + panelCount - 1) % panelCount
+	case "t":
+		m.graphView = !m.graphView
 	case "s":
 		m = m.openPicker()
 	case "G":
