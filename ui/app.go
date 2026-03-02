@@ -28,7 +28,7 @@ const (
 	helpBarHeight = 3
 	maxScrollVal  = 999999
 
-	helpText = "q quit  j/k nav  tab panel  t tree  s sessions  G follow  enter expand  a abort  r refresh"
+	helpText = "q quit  j/k nav  tab panel  s sessions  G follow  enter expand  a abort  r refresh"
 )
 
 type panel int
@@ -50,7 +50,6 @@ type Model struct {
 	messages        map[string][]client.MessageWithParts
 	agentNames      map[string]string
 	tree            []*treeNode
-	graphView       bool
 	flatIDs         []string
 	cursor          int
 	detailScroll    int
@@ -145,44 +144,36 @@ func (m Model) View() tea.View {
 		return v
 	}
 
+	treeW := m.width * treeWidthPercent / 100
+	detailW := m.width - treeW - layoutPadding
 	contentH := m.height - helpBarHeight
 
-	var topRow string
-	if m.graphView {
-		fullW := m.width - panelBorderOffset
-		treeContent := renderGraphTree(m.tree, m.selectedID(), fullW-layoutPadding)
-		topRow = panelBox("Agents", treeContent, fullW, contentH, true)
-	} else {
-		treeW := m.width * treeWidthPercent / 100
-		detailW := m.width - treeW - layoutPadding
+	treeContent := renderTree(m.tree, m.selectedID(), treeW-layoutPadding)
+	treePanel := panelBox("Agents", treeContent, treeW, contentH, m.focus == panelTree)
 
-		treeContent := renderTree(m.tree, m.selectedID(), treeW-layoutPadding)
-		treePanel := panelBox("Agents", treeContent, treeW, contentH, m.focus == panelTree)
-
-		var (
-			sess   *client.Session
-			status string
-		)
-		if id := m.selectedID(); id != "" {
-			for i := range m.sessions {
-				if m.sessions[i].ID == id {
-					sess = &m.sessions[i]
-					if st, ok := m.statuses[id]; ok {
-						status = st.Type
-					}
-					break
+	var (
+		sess   *client.Session
+		status string
+	)
+	if id := m.selectedID(); id != "" {
+		for i := range m.sessions {
+			if m.sessions[i].ID == id {
+				sess = &m.sessions[i]
+				if st, ok := m.statuses[id]; ok {
+					status = st.Type
 				}
+				break
 			}
 		}
-
-		msgs := m.messages[m.selectedID()]
-		detailPanel := panelBox("Details",
-			renderDetail(sess, status, msgs, detailW-layoutPadding, contentH-panelBorderOffset-1, m.detailScroll, m.expandTools),
-			detailW, contentH, m.focus == panelDetail,
-		)
-
-		topRow = lipgloss.JoinHorizontal(lipgloss.Top, treePanel, detailPanel)
 	}
+
+	msgs := m.messages[m.selectedID()]
+	detailPanel := panelBox("Details",
+		renderDetail(sess, status, msgs, detailW-layoutPadding, contentH-panelBorderOffset-1, m.detailScroll, m.expandTools),
+		detailW, contentH, m.focus == panelDetail,
+	)
+
+	topRow := lipgloss.JoinHorizontal(lipgloss.Top, treePanel, detailPanel)
 
 	help := styleHelp.Render(helpText)
 	if m.err != nil {
@@ -259,8 +250,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.focus = (m.focus + 1) % panelCount
 	case "shift+tab":
 		m.focus = (m.focus + panelCount - 1) % panelCount
-	case "t":
-		m.graphView = !m.graphView
 	case "s":
 		m = m.openPicker()
 	case "G":
