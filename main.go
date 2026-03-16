@@ -2,43 +2,150 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"os"
+	"os/exec"
 	"strconv"
-
-	tea "charm.land/bubbletea/v2"
+	"strings"
+	"sync"
+	"syscall"
 
 	"github.com/tkozakas/agent-monitor/client"
-	"github.com/tkozakas/agent-monitor/ui"
 )
 
 const (
 	envURL  = "OPENCODE_URL"
 	envPort = "OPENCODE_PORT"
 	envHost = "OPENCODE_HOST"
-	envDir  = "OPENCODE_DIR"
 
 	defaultHost   = "localhost"
 	defaultScheme = "http"
+	maxPanes      = 4
 )
 
 func main() {
-	clients := resolveClients()
-	if len(clients) == 0 {
-		fmt.Fprintln(os.Stderr, "no opencode servers found; set OPENCODE_URL or start opencode first")
+	urls := resolveURLs()
+	if len(urls) == 0 {
+		fmt.Fprintln(os.Stderr, "no opencode servers found")
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(ui.New(clients...))
-	if _, err := p.Run(); err != nil {
-		log.Fatal(err)
+	var sessions []rootSession
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for i, url := range urls {
+		wg.Add(1)
+		go func(idx int, u string) {
+			defer wg.Done()
+			c := client.New(u)
+			all, err := c.Sessions()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			for _, s := range all {
+				if s.ParentID == nil {
+					sessions = append(sessions, rootSession{url: u, id: s.ID, title: s.Title, clientIdx: idx})
+				}
+			}
+			mu.Unlock()
+		}(i, url)
+	}
+	wg.Wait()
+
+	if len(sessions) == 0 {
+		fmt.Fprintln(os.Stderr, "no root sessions found")
+		os.Exit(1)
+	}
+
+	if len(sessions) > maxPanes {
+		sessions = sessions[:maxPanes]
+	}
+
+	selfPane := currentPaneID()
+	paneIDs := make([]string, len(sessions))
+	paneIDs[0] = selfPane
+
+	for i := 1; i < len(sessions); i++ {
+		target := splitTarget(i, paneIDs)
+		dir := splitDir(i, len(sessions))
+		args := []string{"split-window", dir, "-d", "-P", "-F", "#{pane_id}", "-t", target, "cat"}
+		out, err := exec.Command("tmux", args...).Output()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "split %d: %v\n", i, err)
+			continue
+		}
+		paneIDs[i] = strings.TrimSpace(string(out))
+	}
+
+	if len(sessions) > 2 {
+		exec.Command("tmux", "select-layout", "tiled").Run()
+	}
+
+	var sendWg sync.WaitGroup
+	for i := 1; i < len(sessions); i++ {
+		if paneIDs[i] == "" {
+			continue
+		}
+		sendWg.Add(1)
+		go func(pane string, s rootSession) {
+			defer sendWg.Done()
+			cmd := fmt.Sprintf("opencode attach %s -s %s", s.url, s.id)
+			exec.Command("tmux", "respawn-pane", "-k", "-t", pane, cmd).Run()
+		}(paneIDs[i], sessions[i])
+	}
+	sendWg.Wait()
+
+	first := sessions[0]
+	bin, err := exec.LookPath("opencode")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "opencode not found in PATH")
+		os.Exit(1)
+	}
+	syscall.Exec(bin, []string{"opencode", "attach", first.url, "-s", first.id}, os.Environ())
+}
+
+func splitTarget(index int, paneIDs []string) string {
+	switch index {
+	case 1:
+		return paneIDs[0]
+	case 2:
+		return paneIDs[0]
+	case 3:
+		return paneIDs[1]
+	default:
+		return paneIDs[len(paneIDs)-1]
 	}
 }
 
-func resolveClients() []client.OpenCodeClient {
-	// Explicit URL takes priority — single server mode
+func splitDir(index, total int) string {
+	if total <= 2 {
+		return "-h"
+	}
+	switch index {
+	case 1:
+		return "-h"
+	case 2, 3:
+		return "-v"
+	default:
+		return "-h"
+	}
+}
+
+func currentPaneID() string {
+	out, _ := exec.Command("tmux", "display-message", "-p", "#{pane_id}").Output()
+	return strings.TrimSpace(string(out))
+}
+
+type rootSession struct {
+	url       string
+	id        string
+	title     string
+	clientIdx int
+}
+
+func resolveURLs() []string {
 	if url := os.Getenv(envURL); url != "" {
-		return []client.OpenCodeClient{client.New(url)}
+		return []string{url}
 	}
 
 	host := os.Getenv(envHost)
@@ -46,41 +153,21 @@ func resolveClients() []client.OpenCodeClient {
 		host = defaultHost
 	}
 
-	// Explicit port — single server mode
 	if portStr := os.Getenv(envPort); portStr != "" {
 		port, err := strconv.Atoi(portStr)
 		if err == nil && port > 0 {
-			url := fmt.Sprintf("%s://%s:%d", defaultScheme, host, port)
-			return []client.OpenCodeClient{client.New(url)}
+			return []string{fmt.Sprintf("%s://%s:%d", defaultScheme, host, port)}
 		}
 	}
 
-	// Auto-discover ALL running opencode servers
 	servers, err := client.FindAllServerPorts()
 	if err == nil && len(servers) > 0 {
-		clients := make([]client.OpenCodeClient, 0, len(servers))
+		var urls []string
 		for _, s := range servers {
-			url := fmt.Sprintf("%s://%s:%d", defaultScheme, host, s.Port)
-			clients = append(clients, client.New(url))
+			urls = append(urls, fmt.Sprintf("%s://%s:%d", defaultScheme, host, s.Port))
 		}
-		return clients
+		return urls
 	}
 
-	// Fallback: try legacy single-server discovery
-	dir := os.Getenv(envDir)
-	if dir == "" {
-		var dirErr error
-		dir, dirErr = os.Getwd()
-		if dirErr != nil {
-			dir = "."
-		}
-	}
-
-	port, err := client.FindServerPort(dir)
-	if err != nil {
-		return nil
-	}
-
-	url := fmt.Sprintf("%s://%s:%d", defaultScheme, host, port)
-	return []client.OpenCodeClient{client.New(url)}
+	return nil
 }

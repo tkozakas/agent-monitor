@@ -3,124 +3,93 @@ package client
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
-func TestFindServerPortFromFile(t *testing.T) {
+func TestFindFromStateDirWithServerFile(t *testing.T) {
 	dir := t.TempDir()
 	ocDir := filepath.Join(dir, "opencode")
-	if err := os.MkdirAll(ocDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.WriteFile(
-		filepath.Join(ocDir, "server.json"),
-		[]byte(`{"port": 4096}`),
-		0644,
-	); err != nil {
-		t.Fatal(err)
-	}
+	os.MkdirAll(ocDir, 0755)
+	os.WriteFile(filepath.Join(ocDir, "server.json"), []byte(`{"port": 4096}`), 0644)
 
 	orig := stateDirectory
 	stateDirectory = func() string { return dir }
 	defer func() { stateDirectory = orig }()
 
-	port, err := FindServerPort("")
+	servers, err := findFromStateDir()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if port != 4096 {
-		t.Errorf("expected port 4096, got %d", port)
+	if len(servers) != 1 || servers[0].Port != 4096 {
+		t.Errorf("expected [{4096}], got %v", servers)
 	}
 }
 
-func TestFindServerPortNotFound(t *testing.T) {
-	dir := t.TempDir()
-
-	orig := stateDirectory
-	stateDirectory = func() string { return dir }
-	defer func() { stateDirectory = orig }()
-
-	_, err := FindServerPort("")
-	if err == nil {
-		t.Error("expected error when no server file exists")
-	}
-}
-
-func TestFindAllServerPorts(t *testing.T) {
+func TestFindFromStateDirMultiple(t *testing.T) {
 	dir := t.TempDir()
 	ocDir := filepath.Join(dir, "opencode")
-	if err := os.MkdirAll(ocDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.WriteFile(
-		filepath.Join(ocDir, "server.json"),
-		[]byte(`{"port": 4096, "directory": "/home/user/project1"}`),
-		0644,
-	); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(
-		filepath.Join(ocDir, "other.json"),
-		[]byte(`{"port": 5000, "directory": "/home/user/project2"}`),
-		0644,
-	); err != nil {
-		t.Fatal(err)
-	}
+	os.MkdirAll(ocDir, 0755)
+	os.WriteFile(filepath.Join(ocDir, "a.json"), []byte(`{"port": 4096}`), 0644)
+	os.WriteFile(filepath.Join(ocDir, "b.json"), []byte(`{"port": 5000}`), 0644)
 
 	orig := stateDirectory
 	stateDirectory = func() string { return dir }
 	defer func() { stateDirectory = orig }()
 
-	servers, err := FindAllServerPorts()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	servers, _ := findFromStateDir()
 	if len(servers) != 2 {
 		t.Fatalf("expected 2 servers, got %d", len(servers))
 	}
+}
 
-	ports := map[int]bool{}
-	for _, s := range servers {
-		ports[s.Port] = true
-	}
-	if !ports[4096] || !ports[5000] {
-		t.Errorf("expected ports 4096 and 5000, got %v", servers)
+func TestFindFromStateDirEmpty(t *testing.T) {
+	dir := t.TempDir()
+	orig := stateDirectory
+	stateDirectory = func() string { return dir }
+	defer func() { stateDirectory = orig }()
+
+	servers, _ := findFromStateDir()
+	if len(servers) != 0 {
+		t.Errorf("expected 0 servers, got %d", len(servers))
 	}
 }
 
-func TestFindAllServerPortsDedup(t *testing.T) {
+func TestFindFromStateDirInvalidJSON(t *testing.T) {
 	dir := t.TempDir()
 	ocDir := filepath.Join(dir, "opencode")
-	if err := os.MkdirAll(ocDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.WriteFile(
-		filepath.Join(ocDir, "a.json"),
-		[]byte(`{"port": 4096}`),
-		0644,
-	); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(
-		filepath.Join(ocDir, "b.json"),
-		[]byte(`{"port": 4096}`),
-		0644,
-	); err != nil {
-		t.Fatal(err)
-	}
+	os.MkdirAll(ocDir, 0755)
+	os.WriteFile(filepath.Join(ocDir, "bad.json"), []byte(`not json`), 0644)
 
 	orig := stateDirectory
 	stateDirectory = func() string { return dir }
 	defer func() { stateDirectory = orig }()
 
-	servers, err := FindAllServerPorts()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	servers, _ := findFromStateDir()
+	if len(servers) != 0 {
+		t.Errorf("expected 0 servers, got %d", len(servers))
 	}
-	if len(servers) != 1 {
-		t.Fatalf("expected 1 server after dedup, got %d", len(servers))
+}
+
+func TestPortFlagRegex(t *testing.T) {
+	tests := []struct {
+		line string
+		want int
+	}{
+		{"opencode --port 33667", 33667},
+		{"opencode --port 53335", 53335},
+		{"/usr/bin/opencode --port 4096 --other", 4096},
+		{"opencode", 0},
+		{"opencode attach http://localhost:33667", 0},
+	}
+	for _, tt := range tests {
+		m := portFlag.FindStringSubmatch(tt.line)
+		got := 0
+		if len(m) == 2 {
+			got, _ = strconv.Atoi(m[1])
+		}
+		if got != tt.want {
+			t.Errorf("line %q: expected %d, got %d", tt.line, tt.want, got)
+		}
 	}
 }
