@@ -149,3 +149,59 @@ func TestGetHTTPError(t *testing.T) {
 		t.Error("expected error for 404 response")
 	}
 }
+
+func TestSendMessage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if r.URL.Path != "/session/s1/prompt_async" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL)
+	if err := c.SendMessage("s1", "hello world"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSendMessageError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL)
+	if err := c.SendMessage("s1", "hello"); err == nil {
+		t.Error("expected error for 500 response")
+	}
+}
+
+func TestCreateSession(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		json.NewEncoder(w).Encode(Session{ID: "new-session", Title: "New"})
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL)
+	sess, err := c.CreateSession()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sess.ID != "new-session" {
+		t.Errorf("expected id new-session, got %s", sess.ID)
+	}
+}
+
+func TestBaseURL(t *testing.T) {
+	c := New("http://localhost:9999")
+	if c.BaseURL() != "http://localhost:9999" {
+		t.Errorf("expected http://localhost:9999, got %s", c.BaseURL())
+	}
+}

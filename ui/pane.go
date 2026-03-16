@@ -16,6 +16,7 @@ const (
 	partTextMaxLines    = 20
 	sparklineWidth      = 20
 	toolExpandMaxLines  = 10
+	inputBarHeight      = 3
 
 	partTypeTool    = "tool"
 	partTypeSubtask = "subtask"
@@ -36,8 +37,78 @@ var (
 	styleSparkIn    = lipgloss.NewStyle().Foreground(colorBlue)
 	styleSparkOut   = lipgloss.NewStyle().Foreground(colorGreen)
 	styleSparkCache = lipgloss.NewStyle().Foreground(colorDim)
+
+	styleInputBar = lipgloss.NewStyle().
+			Foreground(colorFg).
+			PaddingLeft(1)
 )
 
+// renderPane renders a single pane's content: session header + messages + optional input bar.
+func renderPane(
+	p Pane,
+	session *client.Session,
+	status string,
+	messages []client.MessageWithParts,
+	width, height int,
+	focused, swapMarked bool,
+) string {
+	if width < 4 || height < 3 {
+		return ""
+	}
+
+	borderStyle := styleBorder
+	title := "empty"
+	if focused {
+		borderStyle = borderStyle.BorderForeground(colorCyan)
+	}
+	if swapMarked {
+		borderStyle = borderStyle.BorderForeground(colorYellow)
+	}
+
+	innerW := width - panelBorderOffset
+	innerH := height - panelBorderOffset
+
+	if session == nil {
+		content := styleDim.Render("  No session")
+		return borderStyle.Width(innerW).Height(height).
+			Render(styleTitle.Render(title) + "\n" + content)
+	}
+
+	title = session.Title
+	if title == "" && len(session.ID) >= titleIDLen {
+		title = session.ID[:titleIDLen]
+	}
+	if len(title) > maxTitleLen {
+		title = title[:maxTitleLen-3] + "..."
+	}
+
+	contentH := innerH - 1 // -1 for title line
+	if p.inputMode {
+		contentH -= inputBarHeight
+	}
+	if contentH < 1 {
+		contentH = 1
+	}
+
+	detail := renderDetail(session, status, messages, innerW, contentH, p.scroll, p.expandTools)
+
+	var content strings.Builder
+	content.WriteString(styleTitle.Render(title))
+	content.WriteString("\n")
+	content.WriteString(detail)
+
+	if p.inputMode {
+		content.WriteString("\n")
+		content.WriteString(styleDim.Render(strings.Repeat("─", clampWidth(innerW-2))))
+		content.WriteString("\n")
+		content.WriteString(styleInputBar.Render(p.input.render(innerW - 2)))
+	}
+
+	return borderStyle.Width(innerW).Height(height).
+		Render(content.String())
+}
+
+// renderDetail renders session metadata + messages with scroll support.
 func renderDetail(
 	session *client.Session,
 	status string,

@@ -273,3 +273,36 @@ func TestRenderDetailExpandTools(t *testing.T) {
 		t.Error("expected tool output in expanded view")
 	}
 }
+
+func TestRenderPaneNilSession(t *testing.T) {
+	p := newPane("empty", 0)
+	result := renderPane(p, nil, "", nil, 60, 20, false, false)
+	if !strings.Contains(result, "No session") {
+		t.Error("expected 'No session' for nil session pane")
+	}
+}
+
+func TestRenderPaneFocused(t *testing.T) {
+	sess := &client.Session{
+		ID:    "abcdef123456",
+		Title: "test session",
+	}
+	sess.Time.Created = time.Now().Add(-1 * time.Minute).UnixMilli()
+	sess.Time.Updated = time.Now().UnixMilli()
+
+	p := newPane("abcdef123456", 0)
+	focused := renderPane(p, sess, "busy", nil, 60, 20, true, false)
+	unfocused := renderPane(p, sess, "busy", nil, 60, 20, false, false)
+
+	if focused == unfocused {
+		t.Error("expected focused and unfocused panes to render differently")
+	}
+}
+
+func TestRenderPaneSmallDimensions(t *testing.T) {
+	p := newPane("s1", 0)
+	result := renderPane(p, nil, "", nil, 2, 2, false, false)
+	if result != "" {
+		t.Error("expected empty for very small dimensions")
+	}
+}

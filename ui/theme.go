@@ -48,6 +48,14 @@ var (
 	styleHelp = lipgloss.NewStyle().
 			Foreground(colorDim).
 			PaddingLeft(1)
+
+	styleSwapMark = lipgloss.NewStyle().
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(colorYellow)
+
+	styleInputPrompt = lipgloss.NewStyle().
+				Foreground(colorCyan).
+				Bold(true)
 )
 
 func statusColor(status string) color.Color {

@@ -102,8 +102,6 @@ func TestPruneIdle(t *testing.T) {
 }
 
 func TestPruneIdleNestedChildrenPruned(t *testing.T) {
-	// Idle parent has one busy child and one idle child.
-	// After pruning: parent kept, busy child kept, idle child removed.
 	nodes := []*treeNode{
 		{
 			session: client.Session{ID: "parent"},
@@ -124,5 +122,92 @@ func TestPruneIdleNestedChildrenPruned(t *testing.T) {
 	}
 	if got[0].children[0].session.ID != "busy-child" {
 		t.Errorf("expected busy-child to survive, got %s", got[0].children[0].session.ID)
+	}
+}
+
+func TestCycleFocus(t *testing.T) {
+	m := New()
+	m.panes = []Pane{
+		{sessionID: "a"},
+		{sessionID: "b"},
+	}
+	m.focusedPane = focusSidebar // -1
+
+	// Forward: sidebar -> pane 0 -> pane 1 -> sidebar
+	m = m.cycleFocus(1)
+	if m.focusedPane != 0 {
+		t.Errorf("expected pane 0, got %d", m.focusedPane)
+	}
+	m = m.cycleFocus(1)
+	if m.focusedPane != 1 {
+		t.Errorf("expected pane 1, got %d", m.focusedPane)
+	}
+	m = m.cycleFocus(1)
+	if m.focusedPane != focusSidebar {
+		t.Errorf("expected sidebar, got %d", m.focusedPane)
+	}
+
+	// Backward
+	m = m.cycleFocus(-1)
+	if m.focusedPane != 1 {
+		t.Errorf("expected pane 1, got %d", m.focusedPane)
+	}
+}
+
+func TestMergeRefresh(t *testing.T) {
+	m := New()
+	m.allSessions = []sessionEntry{
+		{session: client.Session{ID: "old1"}, clientIdx: 0},
+		{session: client.Session{ID: "old2"}, clientIdx: 1},
+	}
+
+	msg := refreshMsg{
+		clientIdx: 0,
+		sessions:  []client.Session{{ID: "new1"}},
+		statuses:  map[string]client.SessionStatus{"new1": {Type: "busy"}},
+	}
+
+	m = m.mergeRefresh(msg)
+	if len(m.allSessions) != 2 {
+		t.Fatalf("expected 2 sessions, got %d", len(m.allSessions))
+	}
+
+	ids := map[string]bool{}
+	for _, e := range m.allSessions {
+		ids[e.session.ID] = true
+	}
+	if !ids["new1"] {
+		t.Error("expected new1 to be present")
+	}
+	if !ids["old2"] {
+		t.Error("expected old2 to be preserved")
+	}
+	if ids["old1"] {
+		t.Error("expected old1 to be replaced")
+	}
+}
+
+func TestExtractAgentName(t *testing.T) {
+	msgs := []client.MessageWithParts{
+		{Info: client.Message{Role: "user"}},
+		{Info: client.Message{Role: "assistant", Agent: "coder"}},
+	}
+	if got := extractAgentName(msgs); got != "coder" {
+		t.Errorf("expected coder, got %s", got)
+	}
+}
+
+func TestExtractAgentNameEmpty(t *testing.T) {
+	msgs := []client.MessageWithParts{
+		{Info: client.Message{Role: "user"}},
+	}
+	if got := extractAgentName(msgs); got != "" {
+		t.Errorf("expected empty, got %s", got)
+	}
+}
+
+func TestExtractAgentNameNil(t *testing.T) {
+	if got := extractAgentName(nil); got != "" {
+		t.Errorf("expected empty for nil, got %s", got)
 	}
 }

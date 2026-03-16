@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,6 +21,8 @@ const (
 	pathAbort         = "/session/%s/abort"
 	pathAgents        = "/app/agents"
 	pathEvents        = "/event"
+	pathPromptAsync   = "/session/%s/prompt_async"
+	pathCreateSession = "/session"
 )
 
 // OpenCodeClient defines the interface for interacting with an opencode server.
@@ -35,6 +38,9 @@ type OpenCodeClient interface {
 	Events() <-chan Event
 	StartEvents()
 	StopEvents()
+	SendMessage(sessionID, text string) error
+	CreateSession() (Session, error)
+	BaseURL() string
 }
 
 // Client is the concrete implementation of OpenCodeClient that talks to an
@@ -229,6 +235,63 @@ func (c *Client) StartEvents() {
 // StopEvents stops the SSE listener. It is safe to call multiple times.
 func (c *Client) StopEvents() {
 	c.sse.stop()
+}
+
+// SendMessage sends a prompt to the given session asynchronously via the opencode API.
+func (c *Client) SendMessage(sessionID, text string) error {
+	url := c.base + fmt.Sprintf(pathPromptAsync, sessionID)
+	body := map[string]interface{}{
+		"parts": []map[string]string{
+			{"type": "text", "content": text},
+		},
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		return fmt.Errorf("send message failed: %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// CreateSession creates a new session on the opencode server.
+func (c *Client) CreateSession() (Session, error) {
+	url := c.base + pathCreateSession
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return Session{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return Session{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		return Session{}, fmt.Errorf("create session failed: %d: %s", resp.StatusCode, string(body))
+	}
+	var s Session
+	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+		return Session{}, err
+	}
+	return s, nil
+}
+
+// BaseURL returns the server base URL this client is connected to.
+func (c *Client) BaseURL() string {
+	return c.base
 }
 
 func get[T any](c *Client, path string) (T, error) {

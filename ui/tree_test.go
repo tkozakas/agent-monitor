@@ -144,31 +144,6 @@ func TestRenderTreeShowsAgentName(t *testing.T) {
 	}
 }
 
-func TestExtractAgentName(t *testing.T) {
-	msgs := []client.MessageWithParts{
-		{Info: client.Message{Role: "user"}},
-		{Info: client.Message{Role: "assistant", Agent: "coder"}},
-	}
-	if got := extractAgentName(msgs); got != "coder" {
-		t.Errorf("expected coder, got %s", got)
-	}
-}
-
-func TestExtractAgentNameEmpty(t *testing.T) {
-	msgs := []client.MessageWithParts{
-		{Info: client.Message{Role: "user"}},
-	}
-	if got := extractAgentName(msgs); got != "" {
-		t.Errorf("expected empty, got %s", got)
-	}
-}
-
-func TestExtractAgentNameNil(t *testing.T) {
-	if got := extractAgentName(nil); got != "" {
-		t.Errorf("expected empty for nil, got %s", got)
-	}
-}
-
 func TestNodeLabel(t *testing.T) {
 	tests := []struct {
 		name     string

@@ -22,17 +22,37 @@ const (
 )
 
 type treeNode struct {
-	session  client.Session
-	status   string
-	agent    string
-	children []*treeNode
+	session   client.Session
+	status    string
+	agent     string
+	clientIdx int
+	children  []*treeNode
+}
+
+// sessionEntry pairs a session with the client index it came from.
+type sessionEntry struct {
+	session   client.Session
+	clientIdx int
 }
 
 func buildTree(sessions []client.Session, statuses map[string]client.SessionStatus, agentNames map[string]string) []*treeNode {
-	byID := make(map[string]*treeNode, len(sessions))
+	return buildTreeMulti(toEntries(sessions, 0), statuses, agentNames)
+}
+
+func toEntries(sessions []client.Session, clientIdx int) []sessionEntry {
+	entries := make([]sessionEntry, len(sessions))
+	for i, s := range sessions {
+		entries[i] = sessionEntry{session: s, clientIdx: clientIdx}
+	}
+	return entries
+}
+
+func buildTreeMulti(entries []sessionEntry, statuses map[string]client.SessionStatus, agentNames map[string]string) []*treeNode {
+	byID := make(map[string]*treeNode, len(entries))
 	var roots []*treeNode
 
-	for _, s := range sessions {
+	for _, e := range entries {
+		s := e.session
 		status := statusIdle
 		if st, ok := statuses[s.ID]; ok {
 			status = st.Type
@@ -41,7 +61,7 @@ func buildTree(sessions []client.Session, statuses map[string]client.SessionStat
 		if agentNames != nil {
 			agent = agentNames[s.ID]
 		}
-		byID[s.ID] = &treeNode{session: s, status: status, agent: agent}
+		byID[s.ID] = &treeNode{session: s, status: status, agent: agent, clientIdx: e.clientIdx}
 	}
 
 	for _, node := range byID {
@@ -164,4 +184,17 @@ func nodeTopic(node *treeNode) string {
 		title = title[:maxTitleLen-3] + "..."
 	}
 	return title
+}
+
+// findNodeClientIdx looks up the clientIdx for a session ID in the tree.
+func findNodeClientIdx(nodes []*treeNode, sessionID string) int {
+	for _, node := range nodes {
+		if node.session.ID == sessionID {
+			return node.clientIdx
+		}
+		if idx := findNodeClientIdx(node.children, sessionID); idx >= 0 {
+			return idx
+		}
+	}
+	return -1
 }

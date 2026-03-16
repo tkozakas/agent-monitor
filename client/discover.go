@@ -71,6 +71,50 @@ func tryAlternateDiscovery(stateDir, projectDir string) (int, error) {
 	return 0, fmt.Errorf("no matching opencode server for directory %s", projectDir)
 }
 
+// ServerInfo holds discovered server port and associated directory.
+type ServerInfo struct {
+	Port      int
+	Directory string
+}
+
+// FindAllServerPorts scans the opencode state directory and returns all
+// running server ports with their project directories.
+func FindAllServerPorts() ([]ServerInfo, error) {
+	stateDir := stateDirectory()
+	if stateDir == "" {
+		return nil, fmt.Errorf("cannot determine state directory")
+	}
+
+	pattern := filepath.Join(stateDir, opencodeDir, serverFileGlob)
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("glob %s: %w", pattern, err)
+	}
+
+	var servers []ServerInfo
+	seen := make(map[int]bool)
+	for _, match := range matches {
+		data, err := os.ReadFile(match)
+		if err != nil {
+			continue
+		}
+		var info struct {
+			Port      int    `json:"port"`
+			Directory string `json:"directory"`
+		}
+		if err := json.Unmarshal(data, &info); err != nil || info.Port <= 0 {
+			continue
+		}
+		if seen[info.Port] {
+			continue
+		}
+		seen[info.Port] = true
+		servers = append(servers, ServerInfo{Port: info.Port, Directory: info.Directory})
+	}
+
+	return servers, nil
+}
+
 func defaultStateDirectory() string {
 	if dir := os.Getenv(envXDGStateHome); dir != "" {
 		return dir

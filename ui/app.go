@@ -20,87 +20,82 @@ const (
 
 	defaultRefreshInterval = 5 * time.Second
 
-	treeWidthPercent  = 30
-	layoutPadding     = 4
-	panelBorderOffset = 2
-	panelCount        = 2
+	sidebarWidthPercent = 22
+	layoutPadding       = 4
+	panelBorderOffset   = 2
 
 	helpBarHeight = 3
 	maxScrollVal  = 999999
 
-	helpText = "q quit  j/k nav  tab panel  f filter  s sessions  G follow  enter expand  a abort  r refresh"
-)
+	focusSidebar = -1
 
-type panel int
-
-const (
-	panelTree panel = iota
-	panelDetail
+	helpText = "q quit  j/k nav  Tab focus  Enter open  x close  i prompt  m swap  G follow  f filter  a abort  r refresh"
 )
 
 // Model is the top-level Bubble Tea model for the agent monitor TUI.
 type Model struct {
-	oc              client.OpenCodeClient
+	clients         []client.OpenCodeClient
 	width           int
 	height          int
-	focus           panel
-	sessions        []client.Session
+	allSessions     []sessionEntry
 	statuses        map[string]client.SessionStatus
-	todos           map[string][]client.Todo
 	messages        map[string][]client.MessageWithParts
 	agentNames      map[string]string
 	tree            []*treeNode
 	flatIDs         []string
+	sidebarCursor   int
 	showAll         bool
-	cursor          int
-	detailScroll    int
-	rootSessionID   string
-	followMode      bool
-	expandTools     bool
-	showPicker      bool
-	pickerSessions  []client.Session
-	pickerCursor    int
+	panes           []Pane
+	focusedPane     int // -1 = sidebar
+	swapMark        int // -1 = none
 	err             error
 	refreshInterval time.Duration
 }
 
 type (
 	refreshMsg struct {
-		sessions []client.Session
-		statuses map[string]client.SessionStatus
+		clientIdx int
+		sessions  []client.Session
+		statuses  map[string]client.SessionStatus
 	}
-	sseMsg   struct{ event client.Event }
-	todosMsg struct {
-		sessionID string
-		todos     []client.Todo
+	sseMsg struct {
+		clientIdx int
+		event     client.Event
 	}
 	messagesMsg struct {
 		sessionID string
 		messages  []client.MessageWithParts
 	}
+	sendResultMsg struct {
+		sessionID string
+		err       error
+	}
 	errMsg  struct{ err error }
 	tickMsg struct{}
 )
 
-// New creates a new Model using the given OpenCodeClient.
-func New(oc client.OpenCodeClient) Model {
+// New creates a new Model using the given OpenCodeClients.
+func New(clients ...client.OpenCodeClient) Model {
 	return Model{
-		oc:              oc,
+		clients:         clients,
 		statuses:        make(map[string]client.SessionStatus),
-		todos:           make(map[string][]client.Todo),
 		messages:        make(map[string][]client.MessageWithParts),
 		agentNames:      make(map[string]string),
-		followMode:      true,
+		focusedPane:     focusSidebar,
+		swapMark:        -1,
 		refreshInterval: parseRefreshInterval(),
 	}
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(
-		fetchSessions(m.oc),
-		startSSE(m.oc),
-		tick(m.refreshInterval),
-	)
+	cmds := make([]tea.Cmd, 0, len(m.clients)*2+1)
+	for i, oc := range m.clients {
+		idx := i
+		cmds = append(cmds, fetchSessions(oc, idx))
+		cmds = append(cmds, startSSE(oc, idx))
+	}
+	cmds = append(cmds, tick(m.refreshInterval))
+	return tea.Batch(cmds...)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -111,16 +106,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	case refreshMsg:
-		m.sessions = msg.sessions
-		m.statuses = msg.statuses
-		m = m.resolveRoot()
-		m = m.filterToTree()
+		m = m.mergeRefresh(msg)
 		m = m.rebuildTree()
-		return m, m.fetchTreeData()
+		return m, m.fetchOpenPaneMessages()
 	case sseMsg:
-		return m.handleSSE(msg.event)
-	case todosMsg:
-		m.todos[msg.sessionID] = msg.todos
+		return m.handleSSE(msg.clientIdx, msg.event)
 	case messagesMsg:
 		m.messages[msg.sessionID] = msg.messages
 		if name := extractAgentName(msg.messages); name != "" {
@@ -129,8 +119,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m = m.rebuildTree()
 			}
 		}
+	case sendResultMsg:
+		if msg.err != nil {
+			m.err = msg.err
+		}
 	case tickMsg:
-		return m, tea.Batch(fetchSessions(m.oc), tick(m.refreshInterval))
+		cmds := make([]tea.Cmd, 0, len(m.clients)+1)
+		for i, oc := range m.clients {
+			cmds = append(cmds, fetchSessions(oc, i))
+		}
+		cmds = append(cmds, tick(m.refreshInterval))
+		return m, tea.Batch(cmds...)
 	case errMsg:
 		m.err = msg.err
 	}
@@ -145,36 +144,27 @@ func (m Model) View() tea.View {
 		return v
 	}
 
-	treeW := m.width * treeWidthPercent / 100
-	detailW := m.width - treeW - layoutPadding
+	sidebarW := m.width * sidebarWidthPercent / 100
+	if sidebarW < 20 {
+		sidebarW = 20
+	}
+	panesW := m.width - sidebarW - 1 // -1 for gap
 	contentH := m.height - helpBarHeight
 
-	treeContent := renderTree(m.tree, m.selectedID(), treeW-layoutPadding)
-	treePanel := panelBox("Agents", treeContent, treeW, contentH, m.focus == panelTree)
+	// Render sidebar
+	treeContent := renderTree(m.tree, m.selectedSidebarID(), sidebarW-layoutPadding)
+	sidebarPanel := panelBox("Sessions", treeContent, sidebarW, contentH, m.focusedPane == focusSidebar)
 
-	var (
-		sess   *client.Session
-		status string
-	)
-	if id := m.selectedID(); id != "" {
-		for i := range m.sessions {
-			if m.sessions[i].ID == id {
-				sess = &m.sessions[i]
-				if st, ok := m.statuses[id]; ok {
-					status = st.Type
-				}
-				break
-			}
-		}
+	// Render panes area
+	var panesArea string
+	if len(m.panes) == 0 {
+		emptyContent := styleDim.Render("  Press Enter on a session to open it here")
+		panesArea = panelBox("Panes", emptyContent, panesW, contentH, false)
+	} else {
+		panesArea = m.renderPanesArea(panesW, contentH)
 	}
 
-	msgs := m.messages[m.selectedID()]
-	detailPanel := panelBox("Details",
-		renderDetail(sess, status, msgs, detailW-layoutPadding, contentH-panelBorderOffset-1, m.detailScroll, m.expandTools),
-		detailW, contentH, m.focus == panelDetail,
-	)
-
-	topRow := lipgloss.JoinHorizontal(lipgloss.Top, treePanel, detailPanel)
+	topRow := lipgloss.JoinHorizontal(lipgloss.Top, sidebarPanel, panesArea)
 
 	help := styleHelp.Render(helpText)
 	if m.err != nil {
@@ -183,294 +173,325 @@ func (m Model) View() tea.View {
 	}
 
 	v.Content = lipgloss.JoinVertical(lipgloss.Left, topRow, help)
-
-	if m.showPicker {
-		overlay := renderPicker(m.pickerSessions, m.statuses, m.pickerCursor, m.width, m.height)
-		v.Content = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, overlay)
-	}
-
 	return v
 }
 
-func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if m.showPicker {
-		switch msg.String() {
-		case "j", "down":
-			m.pickerCursor++
-			if m.pickerCursor >= len(m.pickerSessions) {
-				m.pickerCursor = len(m.pickerSessions) - 1
-			}
-		case "k", "up":
-			m.pickerCursor--
-			if m.pickerCursor < 0 {
-				m.pickerCursor = 0
-			}
-		case "enter":
-			m = m.selectPickerSession()
-			return m, tea.Batch(fetchSessions(m.oc), fetchMessages(m.oc, m.selectedID()))
-		case "esc", "q", "s":
-			m.showPicker = false
+func (m Model) renderPanesArea(totalW, totalH int) string {
+	rects := calcLayout(len(m.panes), totalW, totalH)
+
+	// Group by rows to join horizontally, then vertically
+	type row struct {
+		y     int
+		panes []string
+	}
+	rows := make(map[int]*row)
+	var rowKeys []int
+
+	for i, rect := range rects {
+		p := m.panes[i]
+		sess := m.findSession(p.sessionID)
+		status := ""
+		if st, ok := m.statuses[p.sessionID]; ok {
+			status = st.Type
 		}
-		return m, nil
+		msgs := m.messages[p.sessionID]
+		focused := m.focusedPane == i
+		swapMarked := m.swapMark == i
+
+		rendered := renderPane(p, sess, status, msgs, rect.W, rect.H, focused, swapMarked)
+
+		if _, ok := rows[rect.Y]; !ok {
+			rows[rect.Y] = &row{y: rect.Y}
+			rowKeys = append(rowKeys, rect.Y)
+		}
+		rows[rect.Y].panes = append(rows[rect.Y].panes, rendered)
+	}
+
+	sort.Ints(rowKeys)
+	var renderedRows []string
+	for _, y := range rowKeys {
+		r := rows[y]
+		renderedRows = append(renderedRows, lipgloss.JoinHorizontal(lipgloss.Top, r.panes...))
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, renderedRows...)
+}
+
+func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Handle input mode first
+	if m.focusedPane >= 0 && m.focusedPane < len(m.panes) && m.panes[m.focusedPane].inputMode {
+		return m.handleInputKey(msg)
 	}
 
 	switch msg.String() {
-	case "q", "esc":
-		m.oc.StopEvents()
+	case "q":
+		for _, oc := range m.clients {
+			oc.StopEvents()
+		}
 		return m, tea.Quit
-	case "j", "down":
-		if m.focus == panelDetail {
-			m.followMode = false
-			m.detailScroll++
+	case "esc":
+		// If swap mark active, cancel it
+		if m.swapMark >= 0 {
+			m.swapMark = -1
 			return m, nil
 		}
-		m.cursor++
-		m = m.clampedCursor()
-		m.detailScroll = 0
-		return m, tea.Batch(
-			fetchTodos(m.oc, m.selectedID()),
-			fetchMessages(m.oc, m.selectedID()),
-		)
-	case "k", "up":
-		if m.focus == panelDetail {
-			m.followMode = false
-			m.detailScroll--
-			if m.detailScroll < 0 {
-				m.detailScroll = 0
-			}
-			return m, nil
+		for _, oc := range m.clients {
+			oc.StopEvents()
 		}
-		m.cursor--
-		m = m.clampedCursor()
-		m.detailScroll = 0
-		return m, tea.Batch(
-			fetchTodos(m.oc, m.selectedID()),
-			fetchMessages(m.oc, m.selectedID()),
-		)
+		return m, tea.Quit
+
 	case "tab":
-		m.focus = (m.focus + 1) % panelCount
+		m = m.cycleFocus(1)
 	case "shift+tab":
-		m.focus = (m.focus + panelCount - 1) % panelCount
+		m = m.cycleFocus(-1)
+
+	case "j", "down":
+		if m.focusedPane == focusSidebar {
+			m.sidebarCursor++
+			m = m.clampSidebarCursor()
+		} else if m.focusedPane >= 0 && m.focusedPane < len(m.panes) {
+			m.panes[m.focusedPane].followMode = false
+			m.panes[m.focusedPane].scroll++
+		}
+	case "k", "up":
+		if m.focusedPane == focusSidebar {
+			m.sidebarCursor--
+			m = m.clampSidebarCursor()
+		} else if m.focusedPane >= 0 && m.focusedPane < len(m.panes) {
+			m.panes[m.focusedPane].followMode = false
+			if m.panes[m.focusedPane].scroll > 0 {
+				m.panes[m.focusedPane].scroll--
+			}
+		}
+
+	case "enter":
+		if m.focusedPane == focusSidebar {
+			return m.openSelectedSession()
+		}
+		if m.focusedPane >= 0 && m.focusedPane < len(m.panes) {
+			m.panes[m.focusedPane].expandTools = !m.panes[m.focusedPane].expandTools
+		}
+
+	case "x":
+		if m.focusedPane >= 0 && m.focusedPane < len(m.panes) {
+			m.panes = removePane(m.panes, m.focusedPane)
+			if m.swapMark == m.focusedPane {
+				m.swapMark = -1
+			} else if m.swapMark > m.focusedPane {
+				m.swapMark--
+			}
+			if len(m.panes) == 0 {
+				m.focusedPane = focusSidebar
+			} else if m.focusedPane >= len(m.panes) {
+				m.focusedPane = len(m.panes) - 1
+			}
+		}
+
+	case "i":
+		if m.focusedPane >= 0 && m.focusedPane < len(m.panes) {
+			m.panes[m.focusedPane].inputMode = true
+			m.panes[m.focusedPane].input = newTextInput()
+		}
+
+	case "m":
+		if m.focusedPane >= 0 && m.focusedPane < len(m.panes) {
+			if m.swapMark < 0 {
+				m.swapMark = m.focusedPane
+			} else {
+				m.panes = swapPanes(m.panes, m.swapMark, m.focusedPane)
+				m.swapMark = -1
+			}
+		}
+
+	case "G":
+		if m.focusedPane >= 0 && m.focusedPane < len(m.panes) {
+			m.panes[m.focusedPane].followMode = true
+			m.panes[m.focusedPane].scroll = maxScrollVal
+		}
+
 	case "f":
 		m.showAll = !m.showAll
 		m = m.rebuildTree()
-	case "s":
-		m = m.openPicker()
-	case "G":
-		m.followMode = true
-		m.detailScroll = maxScrollVal
-	case "enter":
-		if m.focus == panelDetail {
-			m.expandTools = !m.expandTools
-		}
+
 	case "a":
-		if id := m.selectedID(); id != "" {
-			return m, abortSession(m.oc, id)
+		if m.focusedPane >= 0 && m.focusedPane < len(m.panes) {
+			p := m.panes[m.focusedPane]
+			oc := m.clients[p.clientIdx]
+			return m, abortSession(oc, p.sessionID)
 		}
+		if m.focusedPane == focusSidebar {
+			if id := m.selectedSidebarID(); id != "" {
+				idx := findNodeClientIdx(m.tree, id)
+				if idx >= 0 && idx < len(m.clients) {
+					return m, abortSession(m.clients[idx], id)
+				}
+			}
+		}
+
 	case "r":
-		return m, fetchSessions(m.oc)
+		cmds := make([]tea.Cmd, len(m.clients))
+		for i, oc := range m.clients {
+			cmds[i] = fetchSessions(oc, i)
+		}
+		return m, tea.Batch(cmds...)
 	}
 	return m, nil
 }
 
-func (m Model) handleSSE(event client.Event) (tea.Model, tea.Cmd) {
+func (m Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	p := &m.panes[m.focusedPane]
+
+	switch msg.String() {
+	case "esc":
+		p.inputMode = false
+		p.input = p.input.clear()
+		return m, nil
+	case "enter":
+		text := p.input.value()
+		if text == "" {
+			return m, nil
+		}
+		sessionID := p.sessionID
+		oc := m.clients[p.clientIdx]
+		p.inputMode = false
+		p.input = p.input.clear()
+		p.followMode = true
+		p.scroll = maxScrollVal
+		return m, sendMessage(oc, sessionID, text)
+	case "backspace":
+		p.input = p.input.backspace()
+	case "delete":
+		p.input = p.input.delete()
+	case "left":
+		p.input = p.input.moveLeft()
+	case "right":
+		p.input = p.input.moveRight()
+	case "home":
+		p.input = p.input.moveHome()
+	case "end":
+		p.input = p.input.moveEnd()
+	default:
+		// Insert printable characters
+		key := msg.String()
+		if len(key) == 1 {
+			p.input = p.input.insert(rune(key[0]))
+		} else if key == "space" {
+			p.input = p.input.insert(' ')
+		}
+	}
+	return m, nil
+}
+
+func (m Model) openSelectedSession() (Model, tea.Cmd) {
+	id := m.selectedSidebarID()
+	if id == "" {
+		return m, nil
+	}
+	clientIdx := findNodeClientIdx(m.tree, id)
+	if clientIdx < 0 {
+		clientIdx = 0
+	}
+	var idx int
+	m.panes, idx = addPane(m.panes, id, clientIdx)
+	m.focusedPane = idx
+
+	oc := m.clients[clientIdx]
+	return m, fetchMessages(oc, id)
+}
+
+func (m Model) cycleFocus(dir int) Model {
+	totalSlots := 1 + len(m.panes) // sidebar + panes
+	if totalSlots <= 1 {
+		return m
+	}
+
+	// Current position: sidebar=-1 maps to 0, pane i maps to i+1
+	current := m.focusedPane + 1 // now 0 = sidebar, 1..n = panes
+	current = (current + dir + totalSlots) % totalSlots
+	m.focusedPane = current - 1 // back to -1 = sidebar, 0..n-1 = panes
+	return m
+}
+
+func (m Model) handleSSE(clientIdx int, event client.Event) (tea.Model, tea.Cmd) {
 	switch event.Type {
 	case client.EventSessionStatus:
 		var e client.SessionStatusEvent
 		if json.Unmarshal(event.Properties, &e) == nil {
-			if m.isInTree(e.SessionID) {
-				m.statuses[e.SessionID] = e.Status
-				m = m.rebuildTree()
-			}
+			m.statuses[e.SessionID] = e.Status
+			m = m.rebuildTree()
 		}
 	case client.EventSessionCreated:
 		var e client.SessionEvent
 		if json.Unmarshal(event.Properties, &e) == nil {
-			if m.isDescendant(e.Info) {
-				m.sessions = append(m.sessions, e.Info)
-				m = m.rebuildTree()
-				return m, tea.Batch(
-					listenSSE(m.oc),
-					fetchMessages(m.oc, e.Info.ID),
-				)
-			}
+			m.allSessions = append(m.allSessions, sessionEntry{session: e.Info, clientIdx: clientIdx})
+			m = m.rebuildTree()
+			return m, tea.Batch(
+				listenSSE(m.clients[clientIdx], clientIdx),
+				fetchMessages(m.clients[clientIdx], e.Info.ID),
+			)
 		}
 	case client.EventSessionUpdated:
 		var e client.SessionEvent
 		if json.Unmarshal(event.Properties, &e) == nil {
-			if m.isInTree(e.Info.ID) {
-				for i := range m.sessions {
-					if m.sessions[i].ID == e.Info.ID {
-						m.sessions[i] = e.Info
-						break
-					}
+			for i := range m.allSessions {
+				if m.allSessions[i].session.ID == e.Info.ID {
+					m.allSessions[i].session = e.Info
+					break
 				}
-				m = m.rebuildTree()
 			}
+			m = m.rebuildTree()
 		}
 	case client.EventMessagePartUpdate:
 		var e client.MessagePartEvent
 		if json.Unmarshal(event.Properties, &e) == nil {
-			if m.isInTree(e.Part.SessionID) {
-				if e.Part.SessionID == m.selectedID() {
-					if m.followMode {
-						m.detailScroll = maxScrollVal
-					}
-					return m, tea.Batch(
-						listenSSE(m.oc),
-						fetchMessages(m.oc, e.Part.SessionID),
-					)
+			sid := e.Part.SessionID
+			// Update follow mode for any open pane showing this session
+			for i := range m.panes {
+				if m.panes[i].sessionID == sid && m.panes[i].followMode {
+					m.panes[i].scroll = maxScrollVal
 				}
+			}
+			if findPaneBySession(m.panes, sid) >= 0 {
+				return m, tea.Batch(
+					listenSSE(m.clients[clientIdx], clientIdx),
+					fetchMessages(m.clients[clientIdx], sid),
+				)
 			}
 		}
 	case client.EventTodoUpdated:
-		var e client.TodoEvent
-		if json.Unmarshal(event.Properties, &e) == nil {
-			if m.isInTree(e.SessionID) {
-				m.todos[e.SessionID] = e.Todos
-			}
-		}
+		// handled by refresh
 	}
-	return m, listenSSE(m.oc)
+	return m, listenSSE(m.clients[clientIdx], clientIdx)
 }
 
-func (m Model) openPicker() Model {
-	m.showPicker = true
-	m.pickerCursor = 0
-
-	var roots []client.Session
-	for _, s := range m.sessions {
-		if s.ParentID == nil {
-			roots = append(roots, s)
+func (m Model) mergeRefresh(msg refreshMsg) Model {
+	// Remove old sessions from this client
+	var kept []sessionEntry
+	for _, e := range m.allSessions {
+		if e.clientIdx != msg.clientIdx {
+			kept = append(kept, e)
 		}
 	}
-	sort.Slice(roots, func(i, j int) bool {
-		return roots[i].Time.Created > roots[j].Time.Created
-	})
-	m.pickerSessions = roots
-
-	for i, s := range m.pickerSessions {
-		if s.ID == m.rootSessionID {
-			m.pickerCursor = i
-			break
-		}
+	// Add new sessions from this client
+	for _, s := range msg.sessions {
+		kept = append(kept, sessionEntry{session: s, clientIdx: msg.clientIdx})
 	}
+	m.allSessions = kept
 
+	// Merge statuses
+	for k, v := range msg.statuses {
+		m.statuses[k] = v
+	}
 	return m
-}
-
-func (m Model) selectPickerSession() Model {
-	if len(m.pickerSessions) == 0 {
-		m.showPicker = false
-		return m
-	}
-	if m.pickerCursor >= len(m.pickerSessions) {
-		m.pickerCursor = len(m.pickerSessions) - 1
-	}
-	m.rootSessionID = m.pickerSessions[m.pickerCursor].ID
-	m.showPicker = false
-	m.cursor = 0
-	m.detailScroll = 0
-	m = m.filterToTree()
-	m = m.rebuildTree()
-	return m
-}
-
-func (m Model) resolveRoot() Model {
-	if len(m.sessions) == 0 {
-		return m
-	}
-
-	if m.rootSessionID != "" {
-		for _, s := range m.sessions {
-			if s.ID == m.rootSessionID {
-				return m
-			}
-		}
-	}
-
-	sorted := make([]client.Session, len(m.sessions))
-	copy(sorted, m.sessions)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].Time.Created > sorted[j].Time.Created
-	})
-
-	for _, s := range sorted {
-		if s.ParentID != nil {
-			continue
-		}
-		if st, ok := m.statuses[s.ID]; ok && st.Type == statusBusy {
-			m.rootSessionID = s.ID
-			return m
-		}
-	}
-
-	for _, s := range sorted {
-		if s.ParentID == nil {
-			m.rootSessionID = s.ID
-			return m
-		}
-	}
-
-	m.rootSessionID = sorted[0].ID
-	return m
-}
-
-func (m Model) filterToTree() Model {
-	if m.rootSessionID == "" {
-		return m
-	}
-
-	idSet := m.treeIDs()
-	var filtered []client.Session
-	for _, s := range m.sessions {
-		if idSet[s.ID] {
-			filtered = append(filtered, s)
-		}
-	}
-	m.sessions = filtered
-	return m
-}
-
-func (m Model) treeIDs() map[string]bool {
-	ids := map[string]bool{m.rootSessionID: true}
-	changed := true
-	for changed {
-		changed = false
-		for _, s := range m.sessions {
-			if s.ParentID != nil && ids[*s.ParentID] && !ids[s.ID] {
-				ids[s.ID] = true
-				changed = true
-			}
-		}
-	}
-	return ids
-}
-
-func (m Model) isInTree(sessionID string) bool {
-	if m.rootSessionID == "" {
-		return true
-	}
-	return m.treeIDs()[sessionID]
-}
-
-func (m Model) isDescendant(s client.Session) bool {
-	if m.rootSessionID == "" {
-		return true
-	}
-	if s.ParentID == nil {
-		return s.ID == m.rootSessionID
-	}
-	return m.treeIDs()[*s.ParentID]
 }
 
 func (m Model) rebuildTree() Model {
-	m.tree = buildTree(m.sessions, m.statuses, m.agentNames)
+	m.tree = buildTreeMulti(m.allSessions, m.statuses, m.agentNames)
 	if !m.showAll {
 		m.tree = pruneIdle(m.tree)
 	}
 	m.flatIDs = flattenTree(m.tree)
-	m = m.clampedCursor()
+	m = m.clampSidebarCursor()
 	return m
 }
 
@@ -485,25 +506,37 @@ func pruneIdle(nodes []*treeNode) []*treeNode {
 	return result
 }
 
-func (m Model) selectedID() string {
+func (m Model) selectedSidebarID() string {
 	if len(m.flatIDs) == 0 {
 		return ""
 	}
-	return m.flatIDs[m.cursor]
+	if m.sidebarCursor >= len(m.flatIDs) {
+		return m.flatIDs[len(m.flatIDs)-1]
+	}
+	return m.flatIDs[m.sidebarCursor]
 }
 
-func (m Model) clampedCursor() Model {
+func (m Model) clampSidebarCursor() Model {
 	max := len(m.flatIDs) - 1
 	if max < 0 {
 		max = 0
 	}
-	if m.cursor < 0 {
-		m.cursor = 0
+	if m.sidebarCursor < 0 {
+		m.sidebarCursor = 0
 	}
-	if m.cursor > max {
-		m.cursor = max
+	if m.sidebarCursor > max {
+		m.sidebarCursor = max
 	}
 	return m
+}
+
+func (m Model) findSession(id string) *client.Session {
+	for i := range m.allSessions {
+		if m.allSessions[i].session.ID == id {
+			return &m.allSessions[i].session
+		}
+	}
+	return nil
 }
 
 func panelBox(title, content string, width, height int, focused bool) string {
@@ -521,7 +554,22 @@ func panelBox(title, content string, width, height int, focused bool) string {
 		Render(styleTitle.Render(title) + "\n" + strings.Join(lines, "\n"))
 }
 
-func fetchSessions(oc client.OpenCodeClient) tea.Cmd {
+func (m Model) fetchOpenPaneMessages() tea.Cmd {
+	if len(m.panes) == 0 {
+		return nil
+	}
+	cmds := make([]tea.Cmd, 0, len(m.panes))
+	for _, p := range m.panes {
+		if p.clientIdx < len(m.clients) {
+			cmds = append(cmds, fetchMessages(m.clients[p.clientIdx], p.sessionID))
+		}
+	}
+	return tea.Batch(cmds...)
+}
+
+// --- Commands ---
+
+func fetchSessions(oc client.OpenCodeClient, clientIdx int) tea.Cmd {
 	return func() tea.Msg {
 		sessions, err := oc.Sessions()
 		if err != nil {
@@ -531,41 +579,28 @@ func fetchSessions(oc client.OpenCodeClient) tea.Cmd {
 		if err != nil {
 			return errMsg{err}
 		}
-		return refreshMsg{sessions: sessions, statuses: statuses}
+		return refreshMsg{clientIdx: clientIdx, sessions: sessions, statuses: statuses}
 	}
 }
 
-func startSSE(oc client.OpenCodeClient) tea.Cmd {
+func startSSE(oc client.OpenCodeClient, clientIdx int) tea.Cmd {
 	return func() tea.Msg {
 		oc.StartEvents()
 		event, ok := <-oc.Events()
 		if !ok {
 			return nil
 		}
-		return sseMsg{event: event}
+		return sseMsg{clientIdx: clientIdx, event: event}
 	}
 }
 
-func listenSSE(oc client.OpenCodeClient) tea.Cmd {
+func listenSSE(oc client.OpenCodeClient, clientIdx int) tea.Cmd {
 	return func() tea.Msg {
 		event, ok := <-oc.Events()
 		if !ok {
 			return nil
 		}
-		return sseMsg{event: event}
-	}
-}
-
-func fetchTodos(oc client.OpenCodeClient, sessionID string) tea.Cmd {
-	if sessionID == "" {
-		return nil
-	}
-	return func() tea.Msg {
-		todos, err := oc.SessionTodos(sessionID)
-		if err != nil {
-			return nil
-		}
-		return todosMsg{sessionID: sessionID, todos: todos}
+		return sseMsg{clientIdx: clientIdx, event: event}
 	}
 }
 
@@ -579,6 +614,13 @@ func fetchMessages(oc client.OpenCodeClient, sessionID string) tea.Cmd {
 			return nil
 		}
 		return messagesMsg{sessionID: sessionID, messages: msgs}
+	}
+}
+
+func sendMessage(oc client.OpenCodeClient, sessionID, text string) tea.Cmd {
+	return func() tea.Msg {
+		err := oc.SendMessage(sessionID, text)
+		return sendResultMsg{sessionID: sessionID, err: err}
 	}
 }
 
@@ -596,15 +638,6 @@ func tick(interval time.Duration) tea.Cmd {
 		time.Sleep(interval)
 		return tickMsg{}
 	}
-}
-
-func (m Model) fetchTreeData() tea.Cmd {
-	cmds := make([]tea.Cmd, 0, len(m.flatIDs)+1)
-	for _, id := range m.flatIDs {
-		cmds = append(cmds, fetchMessages(m.oc, id))
-	}
-	cmds = append(cmds, fetchTodos(m.oc, m.selectedID()))
-	return tea.Batch(cmds...)
 }
 
 func extractAgentName(messages []client.MessageWithParts) string {

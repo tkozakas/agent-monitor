@@ -23,18 +23,22 @@ const (
 )
 
 func main() {
-	serverURL := resolveServerURL()
-	oc := client.New(serverURL)
+	clients := resolveClients()
+	if len(clients) == 0 {
+		fmt.Fprintln(os.Stderr, "no opencode servers found; set OPENCODE_URL or start opencode first")
+		os.Exit(1)
+	}
 
-	p := tea.NewProgram(ui.New(oc))
+	p := tea.NewProgram(ui.New(clients...))
 	if _, err := p.Run(); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func resolveServerURL() string {
+func resolveClients() []client.OpenCodeClient {
+	// Explicit URL takes priority — single server mode
 	if url := os.Getenv(envURL); url != "" {
-		return url
+		return []client.OpenCodeClient{client.New(url)}
 	}
 
 	host := os.Getenv(envHost)
@@ -42,27 +46,41 @@ func resolveServerURL() string {
 		host = defaultHost
 	}
 
+	// Explicit port — single server mode
 	if portStr := os.Getenv(envPort); portStr != "" {
 		port, err := strconv.Atoi(portStr)
 		if err == nil && port > 0 {
-			return fmt.Sprintf("%s://%s:%d", defaultScheme, host, port)
+			url := fmt.Sprintf("%s://%s:%d", defaultScheme, host, port)
+			return []client.OpenCodeClient{client.New(url)}
 		}
 	}
 
+	// Auto-discover ALL running opencode servers
+	servers, err := client.FindAllServerPorts()
+	if err == nil && len(servers) > 0 {
+		clients := make([]client.OpenCodeClient, 0, len(servers))
+		for _, s := range servers {
+			url := fmt.Sprintf("%s://%s:%d", defaultScheme, host, s.Port)
+			clients = append(clients, client.New(url))
+		}
+		return clients
+	}
+
+	// Fallback: try legacy single-server discovery
 	dir := os.Getenv(envDir)
 	if dir == "" {
-		var err error
-		dir, err = os.Getwd()
-		if err != nil {
+		var dirErr error
+		dir, dirErr = os.Getwd()
+		if dirErr != nil {
 			dir = "."
 		}
 	}
 
 	port, err := client.FindServerPort(dir)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "could not find opencode server: %v\nset %s or start opencode first\n", err, envURL)
-		os.Exit(1)
+		return nil
 	}
 
-	return fmt.Sprintf("%s://%s:%d", defaultScheme, host, port)
+	url := fmt.Sprintf("%s://%s:%d", defaultScheme, host, port)
+	return []client.OpenCodeClient{client.New(url)}
 }
